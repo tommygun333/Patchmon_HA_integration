@@ -1,10 +1,12 @@
 {
   "domain": "patchmon",
   "name": "PatchMon",
+  "codeowners": ["@tommygun333"],
   "config_flow": true,
-  "documentation": "https://github.com/PatchMon/PatchMon",
+  "documentation": "https://github.com/tommygun333/Patchmon_HA_integration",
   "integration_type": "hub",
   "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/tommygun333/Patchmon_HA_integration/issues",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.1.1"
 }
