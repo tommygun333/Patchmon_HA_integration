@@ -1,0 +1,203 @@
+"""Sensor entities for PatchMon."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import datetime
+from typing import Any
+
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
+
+from .const import PACKAGE_ATTRIBUTE_LIMIT
+from .coordinator import PatchMonCoordinator
+from .entity import PatchMonHostEntity, hub_device_info
+
+
+FLEET_SENSORS: dict[str, tuple[str, str, Callable[[dict[str, dict[str, Any]]], int]]] = {
+    "total_hosts": ("Total hosts", "mdi:server", lambda hosts: len(hosts)),
+    "hosts_needing_updates": (
+        "Hosts needing updates",
+        "mdi:server-security",
+        lambda hosts: sum(int(h.get("updates_count") or 0) > 0 for h in hosts.values()),
+    ),
+    "total_updates": (
+        "Available updates",
+        "mdi:package-up",
+        lambda hosts: sum(int(h.get("updates_count") or 0) for h in hosts.values()),
+    ),
+    "security_updates": (
+        "Security updates",
+        "mdi:shield-alert",
+        lambda hosts: sum(
+            int(h.get("security_updates_count") or 0) for h in hosts.values()
+        ),
+    ),
+    "offline_hosts": (
+        "Offline hosts",
+        "mdi:server-off",
+        lambda hosts: sum(h.get("effective_status") == "inactive" for h in hosts.values()),
+    ),
+    "hosts_needing_reboot": (
+        "Hosts needing reboot",
+        "mdi:restart-alert",
+        lambda hosts: sum(bool(h.get("needs_reboot")) for h in hosts.values()),
+    ),
+}
+
+HOST_NUMBER_SENSORS: dict[str, tuple[str, str, str]] = {
+    "updates_count": ("Available updates", "mdi:package-up", "updates_count"),
+    "security_updates_count": (
+        "Security updates",
+        "mdi:shield-alert",
+        "security_updates_count",
+    ),
+    "total_packages": ("Installed packages", "mdi:package-variant", "total_packages"),
+}
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up PatchMon sensors and add hosts discovered later."""
+    coordinator: PatchMonCoordinator = entry.runtime_data
+    async_add_entities(
+        PatchMonFleetSensor(coordinator, key, name, icon, value_fn)
+        for key, (name, icon, value_fn) in FLEET_SENSORS.items()
+    )
+
+    known_hosts: set[str] = set()
+
+    @callback
+    def add_hosts() -> None:
+        new_hosts = set((coordinator.data or {}).keys()) - known_hosts
+        if not new_hosts:
+            return
+        entities: list[SensorEntity] = []
+        for host_id in new_hosts:
+            entities.extend(
+                PatchMonHostNumberSensor(coordinator, host_id, key, name, icon, field)
+                for key, (name, icon, field) in HOST_NUMBER_SENSORS.items()
+            )
+            entities.append(PatchMonLastReportSensor(coordinator, host_id))
+        known_hosts.update(new_hosts)
+        async_add_entities(entities)
+
+    add_hosts()
+    entry.async_on_unload(coordinator.async_add_listener(add_hosts))
+
+
+class PatchMonFleetSensor(CoordinatorEntity[PatchMonCoordinator], SensorEntity):
+    """A fleet-wide PatchMon metric."""
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: PatchMonCoordinator,
+        key: str,
+        name: str,
+        icon: str,
+        value_fn: Callable[[dict[str, dict[str, Any]]], int],
+    ) -> None:
+        super().__init__(coordinator)
+        self._value_fn = value_fn
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{key}"
+        self._attr_name = name
+        self._attr_icon = icon
+
+    @property
+    def native_value(self) -> int:
+        """Return the current metric."""
+        return self._value_fn(self.coordinator.data or {})
+
+    @property
+    def device_info(self):
+        """Return the PatchMon hub device."""
+        return hub_device_info(self.coordinator)
+
+
+class PatchMonHostNumberSensor(PatchMonHostEntity, SensorEntity):
+    """A numeric statistic for one host."""
+
+    def __init__(
+        self,
+        coordinator: PatchMonCoordinator,
+        host_id: str,
+        key: str,
+        name: str,
+        icon: str,
+        field: str,
+    ) -> None:
+        super().__init__(coordinator, host_id)
+        self._field = field
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{host_id}_{key}"
+        self._attr_name = name
+        self._attr_icon = icon
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the host statistic."""
+        value = self.host.get(self._field)
+        return int(value) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose update details on the available-updates sensor."""
+        if self._field != "updates_count":
+            return None
+        packages = self.host.get("_update_packages")
+        attrs: dict[str, Any] = {
+            "host_id": self.host_id,
+            "hostname": self.host.get("hostname"),
+            "ip_address": self.host.get("ip"),
+            "host_groups": [
+                group.get("name")
+                for group in self.host.get("host_groups", [])
+                if isinstance(group, dict) and group.get("name")
+            ],
+            "status": self.host.get("effective_status"),
+            "reporting_state": self.host.get("reporting_state"),
+            "update_state": self.host.get("update_state"),
+        }
+        if isinstance(packages, list):
+            visible = packages[:PACKAGE_ATTRIBUTE_LIMIT]
+            attrs["packages"] = [
+                {
+                    "name": package.get("name"),
+                    "current_version": package.get("current_version"),
+                    "available_version": package.get("available_version"),
+                    "security": bool(package.get("is_security_update")),
+                }
+                for package in visible
+            ]
+            attrs["packages_truncated"] = len(packages) > PACKAGE_ATTRIBUTE_LIMIT
+        return attrs
+
+
+class PatchMonLastReportSensor(PatchMonHostEntity, SensorEntity):
+    """Timestamp of the host's last PatchMon report."""
+
+    _attr_name = "Last report"
+    _attr_icon = "mdi:clock-check-outline"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: PatchMonCoordinator, host_id: str) -> None:
+        super().__init__(coordinator, host_id)
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{host_id}_last_report"
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Return the parsed last report timestamp."""
+        value = self.host.get("last_update")
+        if not value:
+            return None
+        return dt_util.parse_datetime(str(value))

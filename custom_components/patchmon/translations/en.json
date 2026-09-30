@@ -1,0 +1,62 @@
+{
+  "title": "PatchMon",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to PatchMon",
+        "description": "Create an API credential with the `host:get` scope in PatchMon. User credentials are optional and enable patch actions. Accounts with two-factor authentication are not currently supported for patch actions.",
+        "data": {
+          "url": "Server URL",
+          "api_id": "API ID",
+          "api_key": "API key",
+          "verify_ssl": "Verify SSL certificate",
+          "username": "PatchMon username (optional)",
+          "password": "PatchMon password (optional)"
+        },
+        "data_description": {
+          "url": "Base URL of the PatchMon server, for example https://patchmon.example.com.",
+          "api_id": "Scoped integration credential ID.",
+          "api_key": "Secret for the scoped integration credential.",
+          "verify_ssl": "Disable only for a trusted server using a self-signed certificate.",
+          "username": "A user allowed to start patch runs.",
+          "password": "Password for the patching user."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect to PatchMon",
+        "description": "The scoped PatchMon API credential is no longer accepted. Enter a current API ID and key with the `host:get` scope.",
+        "data": {
+          "api_id": "API ID",
+          "api_key": "API key"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to PatchMon",
+      "invalid_auth": "PatchMon rejected the credentials",
+      "missing_scope": "The API credential needs the host:get scope",
+      "patch_credentials_incomplete": "Enter both the PatchMon username and password, or leave both empty",
+      "two_factor_required": "This account requires two-factor authentication and cannot be used for unattended patch actions",
+      "unknown": "PatchMon returned an unexpected response"
+    },
+    "abort": {
+      "already_configured": "This PatchMon server is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "PatchMon options",
+        "data": {
+          "scan_interval": "Polling interval (minutes)",
+          "include_packages": "Include package details in sensor attributes",
+          "host_groups": "Host groups"
+        },
+        "data_description": {
+          "include_packages": "Queries package details for every host with pending updates. Disable for large fleets or strict API rate limits.",
+          "host_groups": "Optional comma-separated PatchMon group names or UUIDs."
+        }
+      }
+    }
+  }
+}

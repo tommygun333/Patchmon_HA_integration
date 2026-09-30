@@ -1,0 +1,62 @@
+patch_host:
+  name: Patch host
+  description: Start a PatchMon patch run for all packages or a selected package list.
+  fields:
+    config_entry_id:
+      name: PatchMon server
+      description: Required only when multiple PatchMon servers are configured.
+      selector:
+        config_entry:
+          integration: patchmon
+    host_id:
+      name: Host ID
+      description: UUID of the host in PatchMon.
+      required: true
+      example: 550e8400-e29b-41d4-a716-446655440000
+      selector:
+        text:
+    package_names:
+      name: Package names
+      description: Packages to update. Leave empty to patch all packages.
+      example:
+        - openssl
+        - nginx
+      selector:
+        text:
+          multiple: true
+    dry_run:
+      name: Dry run
+      description: Validate selected packages without installing them. PatchMon does not support dry runs for patch-all.
+      default: false
+      selector:
+        boolean:
+    pending_approval:
+      name: Submit for approval
+      description: Create a pending run that must be approved in PatchMon.
+      default: false
+      selector:
+        boolean:
+    run_immediately:
+      name: Run immediately
+      description: Bypass the host's PatchMon scheduling delay. Patch policy rules still apply.
+      default: false
+      selector:
+        boolean:
+
+get_host_updates:
+  name: Get host updates
+  description: Query the complete current list of upgradable packages for one host. This action returns response data.
+  fields:
+    config_entry_id:
+      name: PatchMon server
+      description: Required only when multiple PatchMon servers are configured.
+      selector:
+        config_entry:
+          integration: patchmon
+    host_id:
+      name: Host ID
+      description: UUID of the host in PatchMon.
+      required: true
+      example: 550e8400-e29b-41d4-a716-446655440000
+      selector:
+        text:
