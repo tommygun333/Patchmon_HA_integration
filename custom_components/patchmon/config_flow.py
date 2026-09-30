@@ -11,6 +11,11 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFl
 from homeassistant.const import CONF_PASSWORD, CONF_URL, CONF_USERNAME, CONF_VERIFY_SSL
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 
 from .api import (
     PatchMonAuthenticationError,
@@ -42,6 +47,15 @@ def _valid_url(value: Any) -> str:
     return url
 
 
+URL_SELECTOR = TextSelector(
+    TextSelectorConfig(type=TextSelectorType.URL, autocomplete="url")
+)
+TEXT_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT))
+PASSWORD_SELECTOR = TextSelector(
+    TextSelectorConfig(type=TextSelectorType.PASSWORD)
+)
+
+
 def _client_from_input(hass: HomeAssistant, data: dict[str, Any]) -> PatchMonClient:
     return PatchMonClient(
         async_get_clientsession(hass),
@@ -65,11 +79,15 @@ class PatchMonConfigFlow(ConfigFlow, domain=DOMAIN):
         """Configure a PatchMon server."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            if bool(user_input.get(CONF_USERNAME)) != bool(
+            try:
+                user_input[CONF_URL] = _valid_url(user_input[CONF_URL])
+            except vol.Invalid:
+                errors[CONF_URL] = "invalid_url"
+            if not errors and bool(user_input.get(CONF_USERNAME)) != bool(
                 user_input.get(CONF_PASSWORD)
             ):
                 errors["base"] = "patch_credentials_incomplete"
-            else:
+            elif not errors:
                 client = _client_from_input(self.hass, user_input)
                 try:
                     await client.async_validate()
@@ -93,12 +111,12 @@ class PatchMonConfigFlow(ConfigFlow, domain=DOMAIN):
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_URL, default="http://patchmon:3000"): _valid_url,
-                vol.Required(CONF_API_ID): str,
-                vol.Required(CONF_API_KEY): str,
+                vol.Required(CONF_URL, default="http://patchmon:3000"): URL_SELECTOR,
+                vol.Required(CONF_API_ID): TEXT_SELECTOR,
+                vol.Required(CONF_API_KEY): PASSWORD_SELECTOR,
                 vol.Required(CONF_VERIFY_SSL, default=True): bool,
-                vol.Optional(CONF_USERNAME): str,
-                vol.Optional(CONF_PASSWORD): str,
+                vol.Optional(CONF_USERNAME): TEXT_SELECTOR,
+                vol.Optional(CONF_PASSWORD): PASSWORD_SELECTOR,
             }
         )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
@@ -137,8 +155,8 @@ class PatchMonConfigFlow(ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(
                         CONF_API_ID, default=entry.data.get(CONF_API_ID, "")
-                    ): str,
-                    vol.Required(CONF_API_KEY): str,
+                    ): TEXT_SELECTOR,
+                    vol.Required(CONF_API_KEY): PASSWORD_SELECTOR,
                 }
             ),
             errors=errors,
