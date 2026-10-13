@@ -42,6 +42,15 @@ class FakeCoordinator:
         self.entry = types.SimpleNamespace(entry_id="entry-1")
         self._host = {"_packages_loaded": loaded, "_tracked_packages": [pkg]}
         self.async_request_refresh = AsyncMock()
+        self.follow_patch = unittest.mock.Mock()
+        self.tracked_packages = {"h-1": ("openssl",)}
+        self.data = {"h-1": self._host}
+
+    def watched_packages(self, host_id):
+        return self.tracked_packages.get(host_id, ())
+
+    def async_add_listener(self, callback):
+        return lambda: None
 
     def host(self, host_id):
         return self._host if host_id == "h-1" else None
@@ -69,6 +78,18 @@ _fake_module("homeassistant.exceptions", HomeAssistantError=RuntimeError)
 _fake_module("homeassistant.helpers")
 _fake_module("homeassistant.helpers.entity_platform", AddEntitiesCallback=object)
 
+class MockEntityRegistry:
+    def __init__(self, entries=None):
+        self.entries = entries or []
+        self.removed = []
+
+    def async_remove(self, entity_id):
+        self.removed.append(entity_id)
+
+registry = MockEntityRegistry()
+_fake_module("homeassistant.helpers.entity_registry", async_get=lambda hass: registry,
+             async_entries_for_config_entry=lambda reg, entry_id: reg.entries)
+
 package_name = "patchmon_entity_test_pkg"
 pkg = types.ModuleType(package_name)
 pkg.__path__ = []
@@ -76,6 +97,14 @@ sys.modules[package_name] = pkg
 _fake_module(f"{package_name}.api", PatchMonError=type("PatchMonError", (Exception,), {}))
 _fake_module(f"{package_name}.coordinator", PatchMonCoordinator=FakeCoordinator)
 _fake_module(f"{package_name}.entity", PatchMonHostEntity=FakeHostEntity)
+_fake_module(f"{package_name}.const", DOMAIN="patchmon")
+# Exercise real dependency-free helpers when testing the update entity.
+utils_path = Path(__file__).parents[1] / "custom_components" / "patchmon" / "patch_utils.py"
+utils_spec = importlib.util.spec_from_file_location(f"{package_name}.patch_utils", utils_path)
+assert utils_spec is not None and utils_spec.loader is not None
+utils_module = importlib.util.module_from_spec(utils_spec)
+sys.modules[utils_spec.name] = utils_module
+utils_spec.loader.exec_module(utils_module)
 
 update_path = Path(__file__).parents[1] / "custom_components" / "patchmon" / "update.py"
 spec = importlib.util.spec_from_file_location(f"{package_name}.update", update_path)
@@ -109,7 +138,8 @@ class PatchMonUpdateEntityTests(unittest.IsolatedAsyncioTestCase):
         entity = module.PatchMonPackageUpdate(coordinator, "h-1", "openssl")
         await entity.async_install(version=None, backup=False)
         coordinator.client.async_patch_host.assert_awaited_once_with("h-1", package_names=["openssl"])
-        coordinator.async_request_refresh.assert_awaited_once()
+        coordinator.follow_patch.assert_called_once_with("h-1", ["openssl"], {"id": "test-run-id"})
+        coordinator.async_request_refresh.assert_not_awaited()
 
     async def test_stale_inventory_refuses_install(self):
         pkg = {"name": "openssl", "current_version": "1.0", "available_version": "1.1", "needs_update": True}
@@ -135,6 +165,29 @@ class PatchMonUpdateEntityTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "already in progress"):
             await entity.async_install(version=None, backup=False)
         coordinator.client.async_patch_host.assert_not_awaited()
+
+    async def test_removed_watches_prune_only_owned_update_entities(self):
+        host = {"name": "openssl", "needs_update": False, "current_version": "3"}
+        coordinator = FakeCoordinator(host)
+        coordinator.tracked_packages = {"h-1": ("openssl",)}
+        coordinator._host["_tracked_packages"] = [host]
+        registry.entries = [
+            types.SimpleNamespace(entity_id="update.old", domain="update", platform="patchmon",
+                                  unique_id="entry-1_h-1_pkg_curl"),
+            types.SimpleNamespace(entity_id="update.kept", domain="update", platform="patchmon",
+                                  unique_id="entry-1_h-1_pkg_openssl"),
+            types.SimpleNamespace(entity_id="update.other", domain="update", platform="another",
+                                  unique_id="entry-1_h-1_pkg_curl"),
+            types.SimpleNamespace(entity_id="sensor.host", domain="sensor", platform="patchmon",
+                                  unique_id="entry-1_h-1_updates_count"),
+        ]
+        registry.removed.clear()
+        entry = types.SimpleNamespace(entry_id="entry-1", runtime_data=coordinator,
+                                      async_on_unload=lambda callback: None)
+        added = []
+        await module.async_setup_entry(None, entry, lambda entities: added.extend(entities))
+        self.assertEqual(registry.removed, ["update.old"])
+        self.assertEqual([entity.package_name for entity in added], ["openssl"])
 
     async def test_no_credentials_is_read_only(self):
         pkg = {"name": "openssl", "current_version": "1.0", "available_version": "1.1", "needs_update": True}

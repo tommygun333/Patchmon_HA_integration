@@ -100,6 +100,17 @@ class PatchMonClientV02Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.requests[2][2]["params"], {"host_id": "host-1", "limit": 1})
         self.assertEqual(session.requests[2][2]["headers"]["Authorization"], "Bearer jwt")
 
+    async def test_patch_run_detail_exposes_console_output(self):
+        session = FakeSession(
+            FakeResponse(200, {"token": "jwt"}),
+            FakeResponse(200, {"id": "run-1", "status": "completed", "shell_output": "updated openssl"}),
+        )
+        client = api.PatchMonClient(session, "https://patchmon.example", "id", "key",
+                                    username="ha", password="pw")
+        run = await client.async_get_patch_run("run-1")
+        self.assertEqual(run["shell_output"], "updated openssl")
+        self.assertTrue(session.requests[-1][1].endswith("/api/v1/patching/runs/run-1"))
+
     async def test_expired_jwt_is_retried_once(self):
         session = FakeSession(
             FakeResponse(200, {"token": "old"}),

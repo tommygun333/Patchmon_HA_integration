@@ -114,6 +114,15 @@ class PatchMonClient:
             raise PatchMonError("PatchMon returned an invalid patch runs response")
         return [run for run in runs if isinstance(run, dict)]
 
+    async def async_get_patch_run(self, run_id: str) -> dict[str, Any]:
+        """Read patch-run status and console output from the user API."""
+        if not self.patching_enabled:
+            raise PatchMonAuthenticationError("Patching credentials are not configured")
+        payload = await self._patch_request("GET", f"/api/v1/patching/runs/{run_id}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+            raise PatchMonError("PatchMon returned an invalid patch run response")
+        return payload
+
     async def async_validate(self) -> None:
         await self.async_get_hosts()
         if self.patching_enabled:

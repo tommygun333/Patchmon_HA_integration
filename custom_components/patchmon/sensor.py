@@ -17,6 +17,7 @@ from homeassistant.util import dt as dt_util
 from .const import PACKAGE_ATTRIBUTE_LIMIT
 from .coordinator import PatchMonCoordinator
 from .entity import PatchMonHostEntity, hub_device_info
+from .patch_utils import console_tail
 
 
 FLEET_SENSORS: dict[str, tuple[str, str, Callable[[dict[str, dict[str, Any]]], int]]] = {
@@ -72,7 +73,7 @@ async def async_setup_entry(
                 for key, (name, icon, field) in HOST_NUMBER_SENSORS.items()
             )
             entities.append(PatchMonLastReportSensor(coordinator, host_id))
-            if coordinator.monitor_patch_runs and coordinator.client.patching_enabled:
+            if coordinator.client.patching_enabled:
                 entities.append(PatchMonLastPatchRunSensor(coordinator, host_id))
         known_hosts.update(new_hosts)
         async_add_entities(entities)
@@ -199,7 +200,7 @@ class PatchMonLastPatchRunSensor(PatchMonHostEntity, SensorEntity):
         if not isinstance(run, dict) or not run:
             return None
         # Avoid putting shell output into recorder attributes.
-        return {
+        attrs = {
             key: run.get(key)
             for key in (
                 "id", "patch_type", "package_name", "package_names",
@@ -207,3 +208,9 @@ class PatchMonLastPatchRunSensor(PatchMonHostEntity, SensorEntity):
             )
             if run.get(key) is not None
         }
+        # A bounded tail is safe for recorder; full output is available on
+        # the PatchMon patch-run detail page.
+        tail = console_tail(run.get("shell_output"))
+        if tail:
+            attrs["console_tail"] = tail
+        return attrs
