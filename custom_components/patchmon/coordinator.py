@@ -116,17 +116,47 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 try:
                     async with semaphore:
                         runs = await self.client.async_get_patch_runs(host_id, limit=1)
-                    self._run_cache[host_id] = runs[0] if runs else {}
+                    latest_run = runs[0] if runs else {}
+                    previous_run = self._run_cache.get(host_id, {})
+                    if (
+                        latest_run.get("id") == previous_run.get("id")
+                        and latest_run.get("status") == previous_run.get("status")
+                        and previous_run.get("_ha_phase")
+                    ):
+                        latest_run = {**latest_run, "_ha_phase": previous_run["_ha_phase"]}
+                    # The normal fleet poll must not displace a run we are
+                    # actively following with an unrelated old history entry.
+                    task = self._follow_tasks.get(host_id)
+                    if not (task and not task.done() and previous_run.get("id") != latest_run.get("id")):
+                        self._run_cache[host_id] = latest_run
                     host["_patch_run_loaded"] = True
                 except PatchMonError as err:
                     _LOGGER.warning("Could not refresh patch runs for %s: %s", host_id, err)
                     host["_patch_run_loaded"] = False
                 if host_id in self._run_cache:
                     host["_patch_run"] = self._run_cache[host_id]
+            # A post-patch report can arrive after the bounded follow task
+            # stopped. A normal coordinator poll should clear that warning
+            # once the watched package is confirmed current.
+            run = self._run_cache.get(host_id)
+            if (
+                run and run.get("_ha_phase") == "awaiting_inventory"
+                and host.get("_packages_loaded") is True
+            ):
+                names = run.get("package_names") or (
+                    [run["package_name"]] if run.get("package_name") else []
+                )
+                packages = host.get("_tracked_packages", [])
+                if names and all(
+                    any(p.get("name") == name and not p.get("needs_update") for p in packages)
+                    for name in names
+                ):
+                    run = {**run, "_ha_phase": "completed"}
+                    self._run_cache[host_id] = run
             # Preserve HA-initiated runs across normal coordinator polls even
             # when fleet-wide patch-run monitoring has been disabled.
-            if host_id in self._run_cache:
-                host["_patch_run"] = self._run_cache[host_id]
+            if run is not None:
+                host["_patch_run"] = run
                 host["_patch_run_loaded"] = True
 
         await asyncio.gather(*(load_host(host_id, host) for host_id, host in host_data.items()))
@@ -208,35 +238,52 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         )
 
     async def _watch_patch_run(self, host_id: str, package_name: str | None, run_id: str) -> None:
-        """Wait for PatchMon to finish, then for its new package report.
+        """Publish PatchMon run stages, then confirm the agent package inventory.
 
-        PatchMon marks a run successful before the agent inventory can be updated.
-        Never treat a queued result as an installed new version. The watcher is
-        intentionally bounded; long scheduled runs remain visible through the
-        optional regular patch-run monitoring.
+        A completed run is not yet a confirmed version update. The stages are
+        exposed to HA as coarse milestones, not actual installation percent.
         """
         terminal: dict[str, Any] | None = None
-        for _ in range(120):  # Up to ~20 min, including scheduled starts.
+        for _ in range(120):  # Up to ~20 min (including scheduled starts).
             await asyncio.sleep(10)
             try:
                 run = await self.client.async_get_patch_run(run_id)
             except PatchMonError as err:
                 _LOGGER.debug("Cannot refresh PatchMon run %s: %s", run_id, err)
                 continue
-            self.publish_patch_run(host_id, run)
             if run.get("status") not in ACTIVE_RUN_STATUSES:
                 terminal = run
+                if run.get("status") in SUCCESS_RUN_STATUSES:
+                    # Keep the progress indicator active while verifying the
+                    # post-install inventory rather than reporting completion
+                    # prematurely.
+                    self.publish_patch_run(host_id, {**run, "_ha_phase": "verifying"})
+                else:
+                    self.publish_patch_run(host_id, {**run, "_ha_phase": "errored"})
                 break
+            self.publish_patch_run(host_id, run)
         if terminal is None:
+            # Timed-out/long-scheduled runs are still tracked by regular polls.
             return
-        # Even a completed run can be awaiting the agent's post-patch inventory.
-        # Poll only the impacted host until the tracked package becomes current.
-        attempts = 36 if terminal.get("status") in SUCCESS_RUN_STATUSES and package_name else 1
+        success = terminal.get("status") in SUCCESS_RUN_STATUSES
+        # Refresh once even on failure: a partially successful run can still
+        # have updated packages. On success, wait for PatchMon's new report.
+        attempts = 36 if success and package_name else 1
+        confirmed = False
         for attempt in range(attempts):
             try:
-                if await self._refresh_one_host_packages(host_id, package_name):
+                confirmed = await self._refresh_one_host_packages(host_id, package_name)
+                if confirmed:
                     break
             except PatchMonError as err:
                 _LOGGER.debug("Waiting for PatchMon post-patch report from %s: %s", host_id, err)
             if attempt + 1 < attempts:
                 await asyncio.sleep(10)
+        if success:
+            phase = "completed" if confirmed else "awaiting_inventory"
+            if not confirmed:
+                _LOGGER.warning(
+                    "PatchMon run %s completed, but %s did not confirm its new inventory",
+                    run_id, host_id,
+                )
+            self.publish_patch_run(host_id, {**terminal, "_ha_phase": phase})

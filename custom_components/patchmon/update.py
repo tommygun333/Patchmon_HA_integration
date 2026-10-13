@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from typing import Any
+import logging
+import re
+import unicodedata
 
 from homeassistant.components.update import UpdateEntity, UpdateEntityFeature
 from homeassistant.config_entries import ConfigEntry
@@ -15,7 +18,16 @@ from .api import PatchMonError
 from .coordinator import PatchMonCoordinator
 from .entity import PatchMonHostEntity
 from .const import DOMAIN
-from .patch_utils import is_active_run, run_matches_package
+from .patch_utils import run_progress
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _slug(value: str) -> str:
+    """Create stable, ASCII-only HA entity-id fragments."""
+    ascii_text = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", ascii_text)).strip("_") or "unknown"
 
 
 async def async_setup_entry(
@@ -44,6 +56,28 @@ async def async_setup_entry(
             and registered.unique_id not in expected_ids
         ):
             registry.async_remove(registered.entity_id)
+            continue
+        # Existing registry entities retain their unique_id (and therefore
+        # history). Rename their entity_id in-place instead of deleting and
+        # recreating them, which would lose customizations.
+        if (
+            registered.domain == "update"
+            and registered.platform == DOMAIN
+            and registered.unique_id in expected_ids
+            and not registered.entity_id.startswith("update.patchmon_")
+        ):
+            new_id = "update.patchmon_" + registered.entity_id.removeprefix("update.")
+            # Do not rename unrelated entities or replace a conflicting ID.
+            if registry.async_get(new_id) is not None:
+                _LOGGER.warning(
+                    "Cannot rename PatchMon update %s to %s: ID already exists",
+                    registered.entity_id, new_id,
+                )
+                continue
+            try:
+                registry.async_update_entity(registered.entity_id, new_entity_id=new_id)
+            except ValueError as err:
+                _LOGGER.warning("Cannot rename PatchMon update %s: %s", registered.entity_id, err)
 
     known: set[tuple[str, str]] = set()
 
@@ -74,9 +108,16 @@ class PatchMonPackageUpdate(PatchMonHostEntity, UpdateEntity):
         self._attr_name = name
         self._attr_title = name
         self._attr_unique_id = f"{coordinator.entry.entry_id}_{host_id}_pkg_{name}"
-        self._attr_supported_features = (
-            UpdateEntityFeature.INSTALL if coordinator.client.patching_enabled else UpdateEntityFeature(0)
-        )
+        self._attr_supported_features = UpdateEntityFeature.PROGRESS
+        if coordinator.client.patching_enabled:
+            self._attr_supported_features |= UpdateEntityFeature.INSTALL
+
+    @property
+    def suggested_object_id(self) -> str:
+        """Force update.patchmon_* for newly registered watched packages."""
+        host = self.host
+        hostname = str(host.get("friendly_name") or host.get("hostname") or self.host_id)
+        return f"patchmon_{_slug(hostname)}_{_slug(self.package_name)}"
 
     @property
     def available(self) -> bool:
@@ -104,11 +145,17 @@ class PatchMonPackageUpdate(PatchMonHostEntity, UpdateEntity):
 
     @property
     def in_progress(self) -> bool:
-        """Report a matching active PatchMon run when history monitoring is on."""
+        return self._progress()[0]
+
+    @property
+    def update_percentage(self) -> int | None:
+        """Stage milestone, NOT a measured installation completion percentage."""
+        return self._progress()[1]
+
+    def _progress(self) -> tuple[bool, int | None, str | None]:
         if self.host.get("_patch_run_loaded") is not True:
-            return False
-        run = self.host.get("_patch_run")
-        return is_active_run(run) and run_matches_package(run, self.package_name)
+            return False, None, None
+        return run_progress(self.host.get("_patch_run"), self.package_name)
 
     def version_is_newer(self, latest_version: str, installed_version: str) -> bool:
         """Package manager versions may not be comparable as SemVer.
@@ -123,7 +170,11 @@ class PatchMonPackageUpdate(PatchMonHostEntity, UpdateEntity):
         package = self.coordinator.tracked_package(self.host_id, self.package_name)
         if not package:
             return None
+        _, milestone, stage = self._progress()
         return {
+            "patch_stage": stage,
+            "progress_type": "stage_based",
+            "stage_milestone": milestone,
             "security_update": bool(package.get("is_security_update")),
             "needs_update": bool(package.get("needs_update")),
             "package_name": self.package_name,

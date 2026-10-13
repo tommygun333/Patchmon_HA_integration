@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 
 class Feature(IntFlag):
     INSTALL = 1
+    PROGRESS = 2
 
 
 class FakeHostEntity:
@@ -82,6 +83,17 @@ class MockEntityRegistry:
     def __init__(self, entries=None):
         self.entries = entries or []
         self.removed = []
+        self.renamed = []
+
+    def async_get(self, entity_id):
+        return next((e for e in self.entries if e.entity_id == entity_id), None)
+
+    def async_update_entity(self, entity_id, *, new_entity_id):
+        old = self.async_get(entity_id)
+        if old is None or self.async_get(new_entity_id) is not None:
+            raise ValueError("Entity already exists or is missing")
+        self.renamed.append((entity_id, new_entity_id))
+        old.entity_id = new_entity_id
 
     def async_remove(self, entity_id):
         self.removed.append(entity_id)
@@ -182,18 +194,82 @@ class PatchMonUpdateEntityTests(unittest.IsolatedAsyncioTestCase):
                                   unique_id="entry-1_h-1_updates_count"),
         ]
         registry.removed.clear()
+        registry.renamed.clear()
         entry = types.SimpleNamespace(entry_id="entry-1", runtime_data=coordinator,
                                       async_on_unload=lambda callback: None)
         added = []
         await module.async_setup_entry(None, entry, lambda entities: added.extend(entities))
         self.assertEqual(registry.removed, ["update.old"])
+        self.assertEqual(registry.renamed, [("update.kept", "update.patchmon_kept")])
         self.assertEqual([entity.package_name for entity in added], ["openssl"])
+
+    def test_new_entity_id_suggested_prefix(self):
+        pkg = {"name": "libssl3", "current_version": "1", "needs_update": False}
+        coordinator = FakeCoordinator(pkg)
+        coordinator._host["friendly_name"] = "Proxmox Lab #1"
+        entity = module.PatchMonPackageUpdate(coordinator, "h-1", "libssl3")
+        self.assertEqual(entity.suggested_object_id, "patchmon_proxmox_lab_1_libssl3")
+
+    async def test_registry_migration_does_not_rename_other_platform_or_conflict(self):
+        pkg = {"name": "openssl", "current_version": "1", "needs_update": False}
+        coordinator = FakeCoordinator(pkg)
+        registry.entries = [
+            types.SimpleNamespace(entity_id="update.lab_openssl", domain="update",
+                platform="patchmon", unique_id="entry-1_h-1_pkg_openssl"),
+            types.SimpleNamespace(entity_id="update.patchmon_lab_openssl", domain="update",
+                platform="other", unique_id="other-id"),
+        ]
+        registry.removed.clear()
+        registry.renamed.clear()
+        entry = types.SimpleNamespace(entry_id="entry-1", runtime_data=coordinator,
+                                      async_on_unload=lambda cb: None)
+        await module.async_setup_entry(None, entry, lambda entities: None)
+        self.assertEqual(registry.renamed, [])
+        self.assertEqual(registry.removed, [])
+
+    def test_progress_shows_real_run_stage_as_visual_milestone(self):
+        pkg = {"name": "openssl", "current_version": "1", "needs_update": True}
+        coordinator = FakeCoordinator(pkg)
+        entity = module.PatchMonPackageUpdate(coordinator, "h-1", "openssl")
+        self.assertTrue(entity._attr_supported_features & Feature.PROGRESS)
+        coordinator._host["_patch_run_loaded"] = True
+        run = {"status": "queued", "patch_type": "patch_package", "package_names": ["openssl"]}
+        coordinator._host["_patch_run"] = run
+        self.assertTrue(entity.in_progress)
+        self.assertEqual(entity.update_percentage, 10)
+        self.assertEqual(entity.extra_state_attributes["patch_stage"], "queued")
+        run["status"] = "running"
+        self.assertEqual(entity.update_percentage, 55)
+        self.assertEqual(entity.extra_state_attributes["patch_stage"], "updating")
+        run["status"] = "completed"
+        run["_ha_phase"] = "verifying"
+        self.assertTrue(entity.in_progress)
+        self.assertEqual(entity.update_percentage, 90)
+        run["_ha_phase"] = "completed"
+        self.assertFalse(entity.in_progress)
+        self.assertIsNone(entity.update_percentage)
+        self.assertEqual(entity.extra_state_attributes["patch_stage"], "completed")
+        run["status"] = "failed"
+        run["_ha_phase"] = "errored"
+        self.assertFalse(entity.in_progress)
+        self.assertEqual(entity.extra_state_attributes["patch_stage"], "errored")
+
+    def test_unrelated_run_does_not_leak_progress(self):
+        pkg = {"name": "openssl", "current_version": "1", "needs_update": True}
+        coordinator = FakeCoordinator(pkg)
+        coordinator._host.update({"_patch_run_loaded": True, "_patch_run": {
+            "status": "running", "patch_type": "patch_package", "package_names": ["curl"]
+        }})
+        entity = module.PatchMonPackageUpdate(coordinator, "h-1", "openssl")
+        self.assertFalse(entity.in_progress)
+        self.assertIsNone(entity.update_percentage)
+        self.assertIsNone(entity.extra_state_attributes["patch_stage"])
 
     async def test_no_credentials_is_read_only(self):
         pkg = {"name": "openssl", "current_version": "1.0", "available_version": "1.1", "needs_update": True}
         coordinator = FakeCoordinator(pkg, patch_auth=False)
         entity = module.PatchMonPackageUpdate(coordinator, "h-1", "openssl")
-        self.assertEqual(entity._attr_supported_features, Feature(0))
+        self.assertEqual(entity._attr_supported_features, Feature.PROGRESS)
         with self.assertRaises(RuntimeError):
             await entity.async_install(version=None, backup=False)
 

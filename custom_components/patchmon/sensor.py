@@ -208,6 +208,8 @@ class PatchMonLastPatchRunSensor(PatchMonHostEntity, SensorEntity):
             )
             if run.get(key) is not None
         }
+        if run.get("_ha_phase"):
+            attrs["update_stage"] = run["_ha_phase"]
         # A bounded tail is safe for recorder; full output is available on
         # the PatchMon patch-run detail page.
         tail = console_tail(run.get("shell_output"))

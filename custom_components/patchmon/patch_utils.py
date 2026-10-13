@@ -33,3 +33,49 @@ def console_tail(output: Any, *, max_chars: int = 2048, max_lines: int = 25) -> 
         return ""
     lines = output.splitlines()[-max_lines:]
     return "\n".join(lines)[-max_chars:]
+
+
+# PatchMon exposes lifecycle states, not a measured installation percentage.
+# These numbers are visual stage milestones only; never interpret them as
+# fraction of packages or bytes installed.
+RUN_STAGE_PROGRESS: dict[str, tuple[str, int]] = {
+    "pending_approval": ("awaiting_approval", 5),
+    "scheduled": ("scheduled", 5),
+    "delayed": ("scheduled", 5),
+    "queued": ("queued", 10),
+    "waiting": ("queued", 10),
+    "pending_validation": ("validating", 25),
+    "validating": ("validating", 25),
+    "running": ("updating", 55),
+}
+
+
+def run_progress(run: dict[str, Any] | None, package: str) -> tuple[bool, int | None, str | None]:
+    """HA update progress (in_progress, stage milestone, stage label).
+
+    Prefer HA's post-install inventory verification stage over PatchMon's
+    terminal 'completed': an agent can report package versions later.
+    """
+    if not run_matches_package(run, package):
+        return False, None, None
+    phase = run.get("_ha_phase")
+    if phase == "verifying":
+        return True, 90, "verifying"
+    if phase == "awaiting_inventory":
+        return False, None, "awaiting_inventory"
+    if phase == "completed":
+        return False, None, "completed"
+    if phase == "errored":
+        return False, None, "errored"
+    status = str(run.get("status") or "").lower()
+    if status in RUN_STAGE_PROGRESS:
+        stage, percentage = RUN_STAGE_PROGRESS[status]
+        return True, percentage, stage
+    if status in ACTIVE_RUN_STATUSES:
+        return True, None, status
+    if status in SUCCESS_RUN_STATUSES:
+        return False, None, "completed"
+    if status in {"failed", "error", "errored", "cancelled", "canceled", "stopped",
+                  "timed_out", "disconnected", "aborted", "validation_failed"}:
+        return False, None, "errored"
+    return False, None, status or None

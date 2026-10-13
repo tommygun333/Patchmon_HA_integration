@@ -101,12 +101,48 @@ class FollowPatchTests(unittest.IsolatedAsyncioTestCase):
         coordinator = mod.PatchMonCoordinator(types.SimpleNamespace(), entry, client)
         coordinator.data = {"h-1": {"_packages_loaded": True,
             "_tracked_packages": [{"name": "openssl", "current_version": "1", "needs_update": True}]}}
+        published = []
+        publish = coordinator.publish_patch_run
+        def track_publish(host_id, run):
+            published.append((run.get("status"), run.get("_ha_phase")))
+            publish(host_id, run)
+        coordinator.publish_patch_run = track_publish
         with patch.object(mod.asyncio, "sleep", new_callable=AsyncMock):
             await coordinator._watch_patch_run("h-1", "openssl", "run-1")
+        self.assertEqual(published, [
+            ("running", None), ("completed", "verifying"), ("completed", "completed")
+        ])
         self.assertEqual(client.async_get_patch_run.await_count, 2)
         self.assertEqual(client.async_get_packages.await_count, 2)
         self.assertEqual(coordinator.data["h-1"]["_tracked_packages"][0]["current_version"], "2")
         self.assertEqual(coordinator.data["h-1"]["_patch_run"]["status"], "completed")
+        self.assertEqual(coordinator.data["h-1"]["_patch_run"]["_ha_phase"], "completed")
+
+    async def test_failed_run_reports_error_without_claiming_success(self):
+        mod = load_coordinator_module()
+        client = types.SimpleNamespace(
+            patching_enabled=True,
+            async_get_patch_run=AsyncMock(return_value={
+                "id": "run-2", "status": "failed", "patch_type": "patch_package",
+                "package_names": ["openssl"], "error_message": "apt failed",
+            }),
+            async_get_packages=AsyncMock(return_value=[
+                {"name": "openssl", "current_version": "1", "needs_update": True},
+            ]),
+        )
+        entry = types.SimpleNamespace(entry_id="entry-1", data={}, options={
+            "tracked_packages": {"h-1": ["openssl"]}
+        }, async_on_unload=lambda cb: None)
+        coordinator = mod.PatchMonCoordinator(types.SimpleNamespace(), entry, client)
+        coordinator.data = {"h-1": {"_packages_loaded": True, "_tracked_packages": [
+            {"name": "openssl", "current_version": "1", "needs_update": True}
+        ]}}
+        with patch.object(mod.asyncio, "sleep", new_callable=AsyncMock):
+            await coordinator._watch_patch_run("h-1", "openssl", "run-2")
+        run = coordinator.data["h-1"]["_patch_run"]
+        self.assertEqual(run["_ha_phase"], "errored")
+        self.assertEqual(run["error_message"], "apt failed")
+        client.async_get_packages.assert_awaited_once()
 
 
 if __name__ == "__main__":
