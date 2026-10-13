@@ -4,7 +4,7 @@
     "step": {
       "user": {
         "title": "Connect to PatchMon",
-        "description": "Create an API credential with the `host:get` scope in PatchMon. User credentials are optional and enable patch actions. Accounts with two-factor authentication are not currently supported for patch actions.",
+        "description": "Use an Integration API credential with `host:get`. Optional username/password enables patch actions until PatchMon adds long-lived patching tokens (PR #596).",
         "data": {
           "url": "Server URL",
           "api_id": "API ID",
@@ -14,17 +14,16 @@
           "password": "PatchMon password (optional)"
         },
         "data_description": {
-          "url": "Base URL of the PatchMon server, for example https://patchmon.example.com.",
-          "api_id": "Scoped integration credential ID.",
-          "api_key": "Secret for the scoped integration credential.",
-          "verify_ssl": "Disable only for a trusted server using a self-signed certificate.",
-          "username": "A user allowed to start patch runs.",
-          "password": "Password for the patching user."
+          "url": "Base URL of the PatchMon server.",
+          "api_id": "Scoped API ID.",
+          "api_key": "Scoped API secret.",
+          "verify_ssl": "Keep enabled unless your server uses an intentionally untrusted TLS certificate.",
+          "username": "PatchMon user with patching permissions.",
+          "password": "Password for that user."
         }
       },
       "reauth_confirm": {
         "title": "Reconnect to PatchMon",
-        "description": "The scoped PatchMon API credential is no longer accepted. Enter a current API ID and key with the `host:get` scope.",
         "data": {
           "api_id": "API ID",
           "api_key": "API key"
@@ -36,28 +35,53 @@
       "invalid_auth": "PatchMon rejected the credentials",
       "invalid_url": "Enter a complete HTTP or HTTPS URL",
       "missing_scope": "The API credential needs the host:get scope",
-      "patch_credentials_incomplete": "Enter both the PatchMon username and password, or leave both empty",
-      "two_factor_required": "This account requires two-factor authentication and cannot be used for unattended patch actions",
-      "unknown": "PatchMon returned an unexpected response"
+      "patch_credentials_incomplete": "Enter both username and password, or neither",
+      "two_factor_required": "Two-factor account cannot be used for unattended patch actions",
+      "unknown": "Unexpected PatchMon API response"
     },
     "abort": {
-      "already_configured": "This PatchMon server is already configured"
+      "already_configured": "This server is already configured"
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "PatchMon options",
+        "menu_options": {
+          "general": "General settings",
+          "tracked_packages": "Watched packages by host"
+        }
+      },
+      "general": {
+        "title": "General PatchMon settings",
         "data": {
           "scan_interval": "Polling interval (minutes)",
-          "include_packages": "Include package details in sensor attributes",
+          "include_packages": "Fetch package details for sensors",
+          "monitor_patch_runs": "Monitor latest patch run per host",
           "host_groups": "Host groups"
         },
         "data_description": {
-          "include_packages": "Queries package details for every host with pending updates. Disable for large fleets or strict API rate limits.",
-          "host_groups": "Optional comma-separated PatchMon group names or UUIDs."
+          "include_packages": "Fetch updates for each host with pending updates. Watched hosts always fetch their full package list.",
+          "monitor_patch_runs": "Requires patch credentials and an enabled PatchMon patching module. Adds one API request per host per polling interval.",
+          "host_groups": "Comma-separated PatchMon group names or UUIDs."
+        }
+      },
+      "tracked_packages": {
+        "title": "Select a host",
+        "data": {
+          "host_id": "Host"
+        }
+      },
+      "edit_host_packages": {
+        "title": "Watched packages for selected host",
+        "description": "Enter exact package names separated by commas or new lines (e.g. openssl, nginx). Clear this field to stop tracking this host. The package must be installed and reported by PatchMon.",
+        "data": {
+          "package_names": "Package names"
         }
       }
+    },
+    "error": {
+      "no_hosts": "No host inventory available; refresh the integration first."
     }
   }
 }

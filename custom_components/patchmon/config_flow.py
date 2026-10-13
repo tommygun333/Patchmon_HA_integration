@@ -1,7 +1,8 @@
-"""Config flow for PatchMon."""
+"""Config and options flows for PatchMon."""
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -12,6 +13,10 @@ from homeassistant.const import CONF_PASSWORD, CONF_URL, CONF_USERNAME, CONF_VER
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -30,8 +35,11 @@ from .const import (
     CONF_API_KEY,
     CONF_HOST_GROUPS,
     CONF_INCLUDE_PACKAGES,
+    CONF_MONITOR_PATCH_RUNS,
     CONF_SCAN_INTERVAL,
+    CONF_TRACKED_PACKAGES,
     DEFAULT_INCLUDE_PACKAGES,
+    DEFAULT_MONITOR_PATCH_RUNS,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     MAX_SCAN_INTERVAL,
@@ -47,13 +55,9 @@ def _valid_url(value: Any) -> str:
     return url
 
 
-URL_SELECTOR = TextSelector(
-    TextSelectorConfig(type=TextSelectorType.URL, autocomplete="url")
-)
+URL_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.URL, autocomplete="url"))
 TEXT_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT))
-PASSWORD_SELECTOR = TextSelector(
-    TextSelectorConfig(type=TextSelectorType.PASSWORD)
-)
+PASSWORD_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
 
 
 def _client_from_input(hass: HomeAssistant, data: dict[str, Any]) -> PatchMonClient:
@@ -69,14 +73,13 @@ def _client_from_input(hass: HomeAssistant, data: dict[str, Any]) -> PatchMonCli
 
 
 class PatchMonConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle PatchMon configuration."""
+    """Handle PatchMon connection setup."""
 
     VERSION = 1
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Configure a PatchMon server."""
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
@@ -105,32 +108,27 @@ class PatchMonConfigFlow(ConfigFlow, domain=DOMAIN):
                     await self.async_set_unique_id(client.base_url.lower())
                     self._abort_if_unique_id_configured()
                     return self.async_create_entry(
-                        title=urlparse(client.base_url).netloc or "PatchMon",
-                        data=user_input,
+                        title=urlparse(client.base_url).netloc or "PatchMon", data=user_input
                     )
 
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_URL, default="http://patchmon:3000"): URL_SELECTOR,
-                vol.Required(CONF_API_ID): TEXT_SELECTOR,
-                vol.Required(CONF_API_KEY): PASSWORD_SELECTOR,
-                vol.Required(CONF_VERIFY_SSL, default=True): bool,
-                vol.Optional(CONF_USERNAME): TEXT_SELECTOR,
-                vol.Optional(CONF_PASSWORD): PASSWORD_SELECTOR,
-            }
-        )
+        schema = vol.Schema({
+            vol.Required(CONF_URL, default="http://patchmon:3000"): URL_SELECTOR,
+            vol.Required(CONF_API_ID): TEXT_SELECTOR,
+            vol.Required(CONF_API_KEY): PASSWORD_SELECTOR,
+            vol.Required(CONF_VERIFY_SSL, default=True): bool,
+            vol.Optional(CONF_USERNAME): TEXT_SELECTOR,
+            vol.Optional(CONF_PASSWORD): PASSWORD_SELECTOR,
+        })
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
     async def async_step_reauth(
         self, entry_data: dict[str, Any]
     ) -> ConfigFlowResult:
-        """Start reauthentication for an expired scoped API credential."""
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Validate replacement scoped API credentials."""
         errors: dict[str, str] = {}
         entry = self._get_reauth_entry()
         if user_input is not None:
@@ -151,50 +149,105 @@ class PatchMonConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_API_ID, default=entry.data.get(CONF_API_ID, "")
-                    ): TEXT_SELECTOR,
-                    vol.Required(CONF_API_KEY): PASSWORD_SELECTOR,
-                }
-            ),
+            data_schema=vol.Schema({
+                vol.Required(CONF_API_ID, default=entry.data.get(CONF_API_ID, "")): TEXT_SELECTOR,
+                vol.Required(CONF_API_KEY): PASSWORD_SELECTOR,
+            }),
             errors=errors,
         )
 
     @staticmethod
     def async_get_options_flow(config_entry):
-        """Return the options flow."""
         return PatchMonOptionsFlow()
 
 
 class PatchMonOptionsFlow(OptionsFlow):
-    """Configure PatchMon polling options."""
+    """Manage general options and explicit per-host package watchlists."""
 
-    async def async_step_init(
+    def _current(self) -> dict[str, Any]:
+        return {**self.config_entry.data, **self.config_entry.options}
+
+    async def async_step_init(self, user_input=None) -> ConfigFlowResult:
+        return self.async_show_menu(
+            step_id="init", menu_options=["general", "tracked_packages"]
+        )
+
+    async def async_step_general(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage polling and host filtering options."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
-        current = {**self.config_entry.data, **self.config_entry.options}
-        schema = vol.Schema(
-            {
-                vol.Required(
-                    CONF_SCAN_INTERVAL,
-                    default=current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
-                ): vol.All(
-                    vol.Coerce(int),
-                    vol.Range(min=MIN_SCAN_INTERVAL, max=MAX_SCAN_INTERVAL),
-                ),
-                vol.Required(
-                    CONF_INCLUDE_PACKAGES,
-                    default=current.get(CONF_INCLUDE_PACKAGES, DEFAULT_INCLUDE_PACKAGES),
-                ): bool,
-                vol.Optional(
-                    CONF_HOST_GROUPS,
-                    default=current.get(CONF_HOST_GROUPS, ""),
-                ): str,
-            }
+            return self.async_create_entry(
+                title="", data={**self.config_entry.options, **user_input}
+            )
+        current = self._current()
+        schema = vol.Schema({
+            vol.Required(
+                CONF_SCAN_INTERVAL,
+                default=current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+            ): vol.All(vol.Coerce(int), vol.Range(min=MIN_SCAN_INTERVAL, max=MAX_SCAN_INTERVAL)),
+            vol.Required(
+                CONF_INCLUDE_PACKAGES,
+                default=current.get(CONF_INCLUDE_PACKAGES, DEFAULT_INCLUDE_PACKAGES),
+            ): bool,
+            vol.Required(
+                CONF_MONITOR_PATCH_RUNS,
+                default=current.get(CONF_MONITOR_PATCH_RUNS, DEFAULT_MONITOR_PATCH_RUNS),
+            ): bool,
+            vol.Optional(CONF_HOST_GROUPS, default=current.get(CONF_HOST_GROUPS, "")): str,
+        })
+        return self.async_show_form(step_id="general", data_schema=schema)
+
+    async def async_step_tracked_packages(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Choose a host by friendly name, not by having to type a UUID."""
+        coordinator = self.config_entry.runtime_data
+        hosts = coordinator.data or {}
+        if user_input is not None:
+            self._selected_host_id = user_input["host_id"]
+            return await self.async_step_edit_host_packages()
+        if not hosts:
+            return self.async_show_form(
+                step_id="tracked_packages", data_schema=vol.Schema({}),
+                errors={"base": "no_hosts"},
+            )
+        choices = [
+            SelectOptionDict(
+                value=host_id,
+                label=f"{host.get('friendly_name') or host.get('hostname') or host_id} ({host_id})",
+            )
+            for host_id, host in sorted(hosts.items(), key=lambda item: str(item[1].get("hostname") or item[0]).lower())
+        ]
+        selector = SelectSelector(
+            SelectSelectorConfig(options=choices, mode=SelectSelectorMode.DROPDOWN)
         )
-        return self.async_show_form(step_id="init", data_schema=schema)
+        return self.async_show_form(
+            step_id="tracked_packages",
+            data_schema=vol.Schema({vol.Required("host_id"): selector}),
+        )
+
+    async def async_step_edit_host_packages(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Enter comma/newline-separated exact package names to track."""
+        host_id = self._selected_host_id
+        current = self._current().get(CONF_TRACKED_PACKAGES, {})
+        current = dict(current) if isinstance(current, dict) else {}
+        if user_input is not None:
+            names = list(dict.fromkeys(
+                name.strip() for name in re.split(r"[,\n]+", user_input.get("package_names", ""))
+                if name.strip()
+            ))
+            if names:
+                current[host_id] = names
+            else:
+                current.pop(host_id, None)
+            return self.async_create_entry(
+                title="",
+                data={**self.config_entry.options, CONF_TRACKED_PACKAGES: current},
+            )
+        default = ", ".join(current.get(host_id, []))
+        return self.async_show_form(
+            step_id="edit_host_packages",
+            data_schema=vol.Schema({vol.Optional("package_names", default=default): TEXT_SELECTOR}),
+        )
