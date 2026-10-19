@@ -237,6 +237,26 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._follow_tasks[host_id] = task
         task.add_done_callback(lambda completed: self._clear_task(host_id, completed))
 
+        # An update can finish before the 10-second status poll sees "running".
+        # Subscribe now: the stream returns a snapshot even for completed runs.
+        # Do not keep a socket open waiting for approval or a scheduled start.
+        from homeassistant.util import dt as dt_util
+
+        run_at = result.get("run_at")
+        scheduled = None
+        if isinstance(run_at, str):
+            try:
+                scheduled = dt_util.parse_datetime(run_at)
+            except (TypeError, ValueError):
+                pass
+        future_run = (
+            scheduled is not None
+            and scheduled.tzinfo is not None
+            and scheduled > dt_util.utcnow() + timedelta(seconds=5)
+        )
+        if not result.get("pending_approval") and not future_run:
+            self._ensure_console_stream(host_id, run_id)
+
     def _ensure_console_stream(self, host_id: str, run_id: str) -> None:
         """One WebSocket per host/run, including runs started outside HA."""
         current = self._stream_tasks.get(host_id)
