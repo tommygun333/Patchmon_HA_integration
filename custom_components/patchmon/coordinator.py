@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 import logging
-import time
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -14,6 +13,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import PatchMonAuthenticationError, PatchMonClient, PatchMonError
+from .host_cleanup import prune_missing_hosts, registered_host_ids
 from .patch_utils import (
     ACTIVE_RUN_STATUSES, SUCCESS_RUN_STATUSES,
 )
@@ -59,8 +59,8 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._stream_run_ids: dict[str, str] = {}
         self._console_flush_tasks: dict[str, asyncio.Task[None]] = {}
         self._console_line_listeners: dict[str, set] = {}
-        # Temporary timing diagnostics; one entry per host (no console text).
-        self._console_diag_last_rx: dict[str, tuple[str, float]] = {}
+        self._missing_host_confirmations: dict[str, int] = {}
+        self.removed_host_ids: frozenset[str] = frozenset()
         # Register once, not once per submitted run (long-lived HA processes
         # could otherwise accumulate unload callbacks indefinitely).
         entry.async_on_unload(self._cancel_follow_tasks)
@@ -187,6 +187,36 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for cache in (self._package_cache, self._run_cache):
             for old_id in cache.keys() - host_data.keys():
                 del cache[old_id]
+
+        # Only a successfully retrieved host inventory can confirm removal.
+        # Two consecutive omissions avoid deleting entities for a transient
+        # incomplete response. Failed API calls never reach this section.
+        missing = registered_host_ids(self.hass, self.entry) - set(host_data)
+        self._missing_host_confirmations = {
+            host_id: self._missing_host_confirmations.get(host_id, 0) + 1
+            for host_id in missing
+        }
+        confirmed = {
+            host_id for host_id, count in self._missing_host_confirmations.items()
+            if count >= 2
+        }
+        self.removed_host_ids = frozenset()
+        if confirmed:
+            self.removed_host_ids = frozenset(
+                prune_missing_hosts(self.hass, self.entry, confirmed)
+            )
+            for host_id in self.removed_host_ids:
+                for tasks in (
+                    self._follow_tasks, self._stream_tasks, self._console_flush_tasks
+                ):
+                    task = tasks.pop(host_id, None)
+                    if task is not None:
+                        task.cancel()
+                self._stream_run_ids.pop(host_id, None)
+            _LOGGER.info(
+                "Removed stale PatchMon host entities for %d host(s)",
+                len(self.removed_host_ids),
+            )
         return host_data
 
     def host(self, host_id: str) -> dict[str, Any] | None:
@@ -304,13 +334,6 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if not run or run.get("id") != run_id:
             return
         kind = event.get("type")
-        received_at = time.monotonic()
-        last_rx = self._console_diag_last_rx.get(host_id)
-        gap_ms = (
-            round((received_at - last_rx[1]) * 1000)
-            if last_rx is not None and last_rx[0] == run_id else None
-        )
-        self._console_diag_last_rx[host_id] = (run_id, received_at)
         previous = str(run.get("_ha_console_output") or "")
         pending = str(run.get("_ha_console_pending") or "")
         sequence = int(run.get("_ha_console_line_number") or 0)
@@ -392,17 +415,6 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         }
         self._run_cache[host_id] = run
 
-        payload = (event.get("chunk") if kind == "chunk" else
-                   event.get("shell_output") if kind == "snapshot" else "")
-        _LOGGER.debug(
-            "PATCHMON_DIAG rx host=%s run=%s type=%s gap_ms=%s "
-            "payload_chars=%d lines=%d pending_chars=%d",
-            host_id, run_id, kind, gap_ms,
-            len(payload) if isinstance(payload, str) else 0,
-            len(completed_lines), len(pending),
-        )
-        publish_started = time.monotonic()
-
         for index, line in enumerate(completed_lines):
             # A distinct HA sensor state update per line (including duplicates).
             # The latest line lives in the state; the entire run remains in
@@ -410,14 +422,6 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             line_sequence = sequence + index + 1
             for listener in tuple(self._console_line_listeners.get(host_id, ())):
                 listener(run_id, line, line_sequence)
-        if completed_lines:
-            _LOGGER.debug(
-                "PATCHMON_DIAG emitted host=%s run=%s lines=%d "
-                "listeners=%d elapsed_ms=%.1f",
-                host_id, run_id, len(completed_lines),
-                len(self._console_line_listeners.get(host_id, ())),
-                (time.monotonic() - publish_started) * 1000,
-            )
 
         if kind != "chunk":
             flush = self._console_flush_tasks.pop(host_id, None)
@@ -446,10 +450,6 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Reconnect with snapshots if chunks are missed; status poll remains fallback."""
         for attempt in range(4):
             try:
-                _LOGGER.debug(
-                    "PATCHMON_DIAG connect host=%s run=%s attempt=%d",
-                    host_id, run_id, attempt + 1,
-                )
                 async for event in self.client.async_stream_patch_run(run_id):
                     self._apply_console_event(host_id, run_id, event)
                     if event.get("type") == "done":

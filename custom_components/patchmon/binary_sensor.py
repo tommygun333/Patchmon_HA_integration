@@ -22,6 +22,7 @@ async def async_setup_entry(
 
     @callback
     def add_hosts() -> None:
+        known_hosts.difference_update(coordinator.removed_host_ids)
         new_hosts = set((coordinator.data or {}).keys()) - known_hosts
         if not new_hosts:
             return

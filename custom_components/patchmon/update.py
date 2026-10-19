@@ -83,6 +83,9 @@ async def async_setup_entry(
 
     @callback
     def add_watched() -> None:
+        known.difference_update(
+            {key for key in known if key[0] in coordinator.removed_host_ids}
+        )
         new: list[PatchMonPackageUpdate] = []
         for host_id in (coordinator.data or {}):
             for name in coordinator.watched_packages(host_id):
