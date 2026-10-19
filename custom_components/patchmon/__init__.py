@@ -126,7 +126,12 @@ def _register_services(hass: HomeAssistant) -> None:
             )
         except PatchMonError as err:
             raise HomeAssistantError(f"Could not start PatchMon patch run: {err}") from err
-        await coordinator.async_request_refresh()
+        if not call.data[ATTR_DRY_RUN] and not call.data[ATTR_PENDING_APPROVAL]:
+            coordinator.follow_patch(
+                call.data[ATTR_HOST_ID], call.data[ATTR_PACKAGE_NAMES] or None, result,
+            )
+        else:
+            await coordinator.async_request_refresh()
         return result
 
     async def get_host_updates(call: ServiceCall) -> dict[str, Any]:

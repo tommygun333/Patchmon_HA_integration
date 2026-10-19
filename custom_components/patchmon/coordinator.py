@@ -15,7 +15,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import PatchMonAuthenticationError, PatchMonClient, PatchMonError
 from .host_cleanup import prune_missing_hosts, registered_host_ids
 from .patch_utils import (
-    ACTIVE_RUN_STATUSES, SUCCESS_RUN_STATUSES,
+    ACTIVE_RUN_STATUSES, SUCCESS_RUN_STATUSES, post_patch_report_is_fresh,
 )
 from .const import (
     CONF_HOST_GROUPS,
@@ -127,12 +127,13 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                         runs = await self.client.async_get_patch_runs(host_id, limit=1)
                     latest_run = runs[0] if runs else {}
                     previous_run = self._run_cache.get(host_id, {})
-                    if (
-                        latest_run.get("id") == previous_run.get("id")
-                        and latest_run.get("status") == previous_run.get("status")
-                        and previous_run.get("_ha_phase")
-                    ):
-                        latest_run = {**latest_run, "_ha_phase": previous_run["_ha_phase"]}
+                    if latest_run.get("id") == previous_run.get("id"):
+                        latest_run = dict(latest_run)
+                        for key in (
+                            "_ha_phase", "_ha_target_packages", "_ha_before_last_update",
+                        ):
+                            if key in previous_run and key not in latest_run:
+                                latest_run[key] = previous_run[key]
                     # The normal fleet poll must not displace a run we are
                     # actively following with an unrelated old history entry.
                     task = self._follow_tasks.get(host_id)
@@ -158,14 +159,21 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 run and run.get("_ha_phase") == "awaiting_inventory"
                 and host.get("_packages_loaded") is True
             ):
-                names = run.get("package_names") or (
-                    [run["package_name"]] if run.get("package_name") else []
-                )
-                packages = host.get("_tracked_packages", [])
-                if names and all(
-                    any(p.get("name") == name and not p.get("needs_update") for p in packages)
-                    for name in names
-                ):
+                if run.get("patch_type") == "patch_all":
+                    verified = post_patch_report_is_fresh(
+                        run.get("_ha_before_last_update"),
+                        host.get("last_update"), run.get("completed_at"),
+                    )
+                else:
+                    names = run.get("package_names") or (
+                        [run["package_name"]] if run.get("package_name") else []
+                    )
+                    packages = host.get("_tracked_packages", [])
+                    verified = bool(names) and all(
+                        any(p.get("name") == name and not p.get("needs_update") for p in packages)
+                        for name in names
+                    )
+                if verified:
                     run = {**run, "_ha_phase": "completed"}
                     self._run_cache[host_id] = run
             # Preserve HA-initiated runs across normal coordinator polls even
@@ -228,7 +236,8 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if previous and previous.get("id") == run.get("id"):
             run = dict(run)
             for key in ("_ha_console_output", "_ha_console_live", "_ha_console_pending",
-                                        "_ha_console_last_line", "_ha_console_line_number"):
+                        "_ha_console_last_line", "_ha_console_line_number",
+                        "_ha_target_packages", "_ha_before_last_update"):
                 if key not in run and key in previous:
                     run[key] = previous[key]
         self._run_cache[host_id] = run
@@ -256,6 +265,19 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             "package_names": names,
             "scheduled_at": result.get("run_at"),
         }
+        if not names:
+            # Freeze the packages that actually needed updates at submission.
+            # A patch-all run must not show progress for already-current Alloy,
+            # etc. This snapshot survives subsequent inventory refreshes.
+            packages = self._package_cache.get(host_id)
+            if packages is None:
+                packages = (self.host(host_id) or {}).get("_update_packages", [])
+            run["_ha_target_packages"] = sorted({
+                str(pkg["name"]) for pkg in packages
+                if isinstance(pkg, dict) and pkg.get("name")
+                and pkg.get("needs_update") is True
+            })
+            run["_ha_before_last_update"] = (self.host(host_id) or {}).get("last_update")
         self.publish_patch_run(host_id, run)
         previous = self._follow_tasks.get(host_id)
         if previous and not previous.done():
@@ -484,14 +506,19 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if self._follow_tasks.get(host_id) is task:
             self._follow_tasks.pop(host_id, None)
 
-    async def _refresh_one_host_packages(self, host_id: str, package_name: str | None) -> bool:
-        """Refresh only the affected host; avoid polling the entire fleet."""
+    async def _refresh_one_host_packages(
+        self, host_id: str, package_name: str | None,
+        *, fresh_host: dict[str, Any] | None = None,
+    ) -> bool:
+        """Refresh host packages, optionally with fresh post-patch host metadata."""
         tracked = bool(self.watched_packages(host_id))
         packages = await self.client.async_get_packages(host_id, updates_only=not tracked)
         self._package_cache[host_id] = packages
         if self.data and host_id in self.data:
             data = dict(self.data)
             host = dict(data[host_id])
+            if fresh_host is not None:
+                host.update({k: v for k, v in fresh_host.items() if not k.startswith("_")})
             host["_packages_loaded"] = True
             host["_update_packages"] = [p for p in packages if p.get("needs_update", True)]
             if tracked:
@@ -504,6 +531,19 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             pkg.get("name") == package_name and not pkg.get("needs_update")
             for pkg in packages
         )
+
+    async def _fresh_post_patch_host(
+        self, host_id: str, run: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Wait for an actual agent inventory report after patch-all finished."""
+        hosts = await self.client.async_get_hosts(self.host_groups or None)
+        host = next((h for h in hosts if str(h.get("id")) == host_id), None)
+        if host is None:
+            return None
+        return host if post_patch_report_is_fresh(
+            run.get("_ha_before_last_update"),
+            host.get("last_update"), run.get("completed_at"),
+        ) else None
 
     async def _watch_patch_run(self, host_id: str, package_name: str | None, run_id: str) -> None:
         """Publish PatchMon run stages, then confirm the agent package inventory.
@@ -536,13 +576,23 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             # Timed-out/long-scheduled runs are still tracked by regular polls.
             return
         success = terminal.get("status") in SUCCESS_RUN_STATUSES
-        # Refresh once even on failure: a partially successful run can still
-        # have updated packages. On success, wait for PatchMon's new report.
-        attempts = 36 if success and package_name else 1
+        # A patch-all job must not be considered verified merely because an
+        # endpoint returned the *old* package inventory. Wait for a new agent
+        # report first, then fetch packages and host summary in the same pass.
+        tracked_run = self.console_run(host_id)
+        patch_all = tracked_run.get("patch_type") == "patch_all"
+        attempts = 36 if success else 1
         confirmed = False
         for attempt in range(attempts):
             try:
-                confirmed = await self._refresh_one_host_packages(host_id, package_name)
+                if success and patch_all:
+                    fresh_host = await self._fresh_post_patch_host(host_id, tracked_run)
+                    if fresh_host is not None:
+                        confirmed = await self._refresh_one_host_packages(
+                            host_id, None, fresh_host=fresh_host,
+                        )
+                else:
+                    confirmed = await self._refresh_one_host_packages(host_id, package_name)
                 if confirmed:
                     break
             except PatchMonError as err:

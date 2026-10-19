@@ -12,15 +12,54 @@ SUCCESS_RUN_STATUSES = frozenset({"completed", "success", "succeeded"})
 
 
 def run_matches_package(run: dict[str, Any] | None, package: str) -> bool:
-    """Match both patch-all and specifically selected package runs."""
+    """Only show package progress for packages selected for this run.
+
+    A patch-all run does not necessarily update every installed package. Never
+    claim that an already-current package is being installed. For a run without
+    a pre-patch inventory, prefer no per-package progress to false progress.
+    The host-level patch status and console remain available independently.
+    """
     if not isinstance(run, dict):
         return False
     if run.get("patch_type") == "patch_all":
-        return True
+        targets = run.get("_ha_target_packages")
+        return isinstance(targets, (list, tuple, set)) and package in targets
     packages = run.get("package_names")
     return run.get("package_name") == package or (
         isinstance(packages, list) and package in packages
     )
+
+
+def post_patch_report_is_fresh(previous: Any, current: Any, completed: Any) -> bool:
+    """True only when PatchMon reports an inventory newer than the patch run.
+
+    The host's last_update belongs to the agent's inventory report, whereas a
+    successful patch-run status only says that the command finished. Never
+    equate the two; that would leave HA showing outdated package versions.
+    """
+    from datetime import datetime, timezone
+
+    def parse(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    after = parse(current)
+    before = parse(previous)
+    finished = parse(completed)
+    if after is None or (before is None and finished is None):
+        return False
+    if before is not None and after <= before:
+        return False
+    if finished is not None and after < finished:
+        return False
+    return True
 
 
 def is_active_run(run: dict[str, Any] | None) -> bool:

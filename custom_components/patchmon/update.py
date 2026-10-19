@@ -18,7 +18,7 @@ from .api import PatchMonError
 from .coordinator import PatchMonCoordinator
 from .entity import PatchMonHostEntity
 from .const import DOMAIN
-from .patch_utils import run_progress
+from .patch_utils import run_matches_package, run_progress
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -174,6 +174,8 @@ class PatchMonPackageUpdate(PatchMonHostEntity, UpdateEntity):
         if not package:
             return None
         _, milestone, stage = self._progress()
+        run = self.host.get("_patch_run") or {}
+        relevant = run_matches_package(run, self.package_name)
         return {
             "patch_stage": stage,
             "progress_type": "stage_based",
@@ -182,12 +184,8 @@ class PatchMonPackageUpdate(PatchMonHostEntity, UpdateEntity):
             "needs_update": bool(package.get("needs_update")),
             "package_name": self.package_name,
             "host_id": self.host_id,
-            "last_patch_status": (
-                self.host.get("_patch_run") or {}
-            ).get("status"),
-            "last_patch_run_id": (
-                self.host.get("_patch_run") or {}
-            ).get("id"),
+            "last_patch_status": run.get("status") if relevant else None,
+            "last_patch_run_id": run.get("id") if relevant else None,
         }
 
     async def async_install(self, version: str | None, backup: bool, **kwargs) -> None:

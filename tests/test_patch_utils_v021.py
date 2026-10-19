@@ -24,7 +24,25 @@ class PatchRunUtilitiesTests(unittest.TestCase):
         run = {"patch_type": "patch_package", "package_names": ["openssl", "curl"]}
         self.assertTrue(module.run_matches_package(run, "curl"))
         self.assertFalse(module.run_matches_package(run, "nginx"))
-        self.assertTrue(module.run_matches_package({"patch_type": "patch_all"}, "nginx"))
+        # Patch-all status is host-wide; it must not imply an up-to-date
+        # individual package was upgraded.
+        self.assertFalse(module.run_matches_package({"patch_type": "patch_all"}, "nginx"))
+        self.assertTrue(module.run_matches_package({
+            "patch_type": "patch_all", "_ha_target_packages": ["curl"],
+        }, "curl"))
+        self.assertFalse(module.run_matches_package({
+            "patch_type": "patch_all", "_ha_target_packages": ["curl"],
+        }, "alloy"))
+
+    def test_patch_all_requires_fresh_host_report(self):
+        fresh = module.post_patch_report_is_fresh
+        self.assertFalse(fresh("2026-10-19T11:00:00Z", "2026-10-19T11:00:00Z",
+                               "2026-10-19T11:05:00Z"))
+        self.assertFalse(fresh("2026-10-19T11:00:00Z", "2026-10-19T11:04:00Z",
+                               "2026-10-19T11:05:00Z"))
+        self.assertTrue(fresh("2026-10-19T11:00:00Z", "2026-10-19T11:06:00Z",
+                              "2026-10-19T11:05:00Z"))
+        self.assertFalse(fresh(None, None, None))
 
     def test_stage_progress_not_leaked_between_packages(self):
         run = {"status": "queued", "patch_type": "patch_package", "package_names": ["openssl"]}
