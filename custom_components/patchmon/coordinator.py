@@ -14,8 +14,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import PatchMonAuthenticationError, PatchMonClient, PatchMonError
 from .patch_utils import (
-    ACTIVE_RUN_STATUSES, CONSOLE_OUTPUT_LIMIT, SUCCESS_RUN_STATUSES,
-    console_preview,
+    ACTIVE_RUN_STATUSES, SUCCESS_RUN_STATUSES,
 )
 from .const import (
     CONF_HOST_GROUPS,
@@ -58,6 +57,7 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._stream_tasks: dict[str, asyncio.Task[None]] = {}
         self._stream_run_ids: dict[str, str] = {}
         self._console_flush_tasks: dict[str, asyncio.Task[None]] = {}
+        self._console_line_listeners: dict[str, set] = {}
         # Register once, not once per submitted run (long-lived HA processes
         # could otherwise accumulate unload callbacks indefinitely).
         entry.async_on_unload(self._cancel_follow_tasks)
@@ -136,7 +136,8 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     if not (task and not task.done() and previous_run.get("id") != latest_run.get("id")):
                         if latest_run.get("id") == previous_run.get("id"):
                             latest_run = dict(latest_run)
-                            for key in ("_ha_console_output", "_ha_console_truncated", "_ha_console_live"):
+                            for key in ("_ha_console_output", "_ha_console_live", "_ha_console_pending",
+                                        "_ha_console_last_line", "_ha_console_line_number"):
                                 if key in previous_run and key not in latest_run:
                                     latest_run[key] = previous_run[key]
                         self._run_cache[host_id] = latest_run
@@ -193,7 +194,8 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         previous = self._run_cache.get(host_id)
         if previous and previous.get("id") == run.get("id"):
             run = dict(run)
-            for key in ("_ha_console_output", "_ha_console_truncated", "_ha_console_live"):
+            for key in ("_ha_console_output", "_ha_console_live", "_ha_console_pending",
+                                        "_ha_console_last_line", "_ha_console_line_number"):
                 if key not in run and key in previous:
                     run[key] = previous[key]
         self._run_cache[host_id] = run
@@ -252,42 +254,121 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             self._stream_tasks.pop(host_id, None)
             self._stream_run_ids.pop(host_id, None)
 
+    def console_run(self, host_id: str) -> dict[str, Any]:
+        """Return the most recent data, including chunks not yet coordinator-flushed."""
+        return self._run_cache.get(host_id) or (self.host(host_id) or {}).get("_patch_run") or {}
+
+    def add_console_line_listener(self, host_id: str, listener):
+        """Listen to individual completed lines without waiting for a status poll."""
+        listeners = self._console_line_listeners.setdefault(host_id, set())
+        listeners.add(listener)
+
+        def remove() -> None:
+            listeners.discard(listener)
+            if not listeners:
+                self._console_line_listeners.pop(host_id, None)
+
+        return remove
+
     def _apply_console_event(self, host_id: str, run_id: str, event: dict[str, Any]) -> None:
-        """Append live chunks without ever publishing unlimited output to HA."""
+        """Keep COMPLETE output and publish every newly completed console line.
+
+        The server's snapshot is authoritative after reconnect. Only its new
+        suffix is emitted as live lines, so reconnecting does not replay history.
+        A chunk can contain multiple lines or a partial line.
+        """
         run = self._run_cache.get(host_id)
         if not run or run.get("id") != run_id:
             return
         kind = event.get("type")
         previous = str(run.get("_ha_console_output") or "")
-        truncated = bool(run.get("_ha_console_truncated"))
+        pending = str(run.get("_ha_console_pending") or "")
+        sequence = int(run.get("_ha_console_line_number") or 0)
+        last_line = run.get("_ha_console_last_line")
+        completed_lines: list[str] = []
+
         if kind == "snapshot":
             snapshot = event.get("shell_output")
             if not isinstance(snapshot, str):
                 return
-            output = console_preview(snapshot)
-            truncated = len(snapshot) > CONSOLE_OUTPUT_LIMIT
+            if "_ha_console_output" not in run:
+                # Initial snapshot: show the latest historic line without
+                # replaying an entire existing run into HA history.
+                addition = ""
+                output = snapshot
+                normalized = snapshot.replace("\r\n", "\n").replace("\r", "\n")
+                parts = normalized.split("\n")
+                pending = parts[-1]
+                if len(parts) > 1:
+                    sequence = len(parts) - 2
+                    last_line = parts[-2]
+                    completed_lines.append(last_line)
+            elif snapshot.startswith(previous):
+                addition = snapshot[len(previous):]
+                output = snapshot
+            elif previous.startswith(snapshot):
+                # Persisted output may lag events we received before reconnect.
+                addition = ""
+                output = previous
+            else:
+                # First subscription or authoritative reset: prime the state
+                # from the snapshot without replaying every historic line.
+                addition = ""
+                output = snapshot
+                normalized = snapshot.replace("\r\n", "\n").replace("\r", "\n")
+                parts = normalized.split("\n")
+                pending = parts[-1]
+                sequence = max(0, len(parts) - 2)
+                if len(parts) > 1:
+                    last_line = parts[-2]
+                    completed_lines.append(last_line)
         elif kind == "chunk":
-            chunk = event.get("chunk")
-            if not isinstance(chunk, str) or not chunk:
+            addition = event.get("chunk")
+            if not isinstance(addition, str) or not addition:
                 return
-            combined = previous + chunk
-            output = console_preview(combined)
-            truncated = truncated or len(combined) > CONSOLE_OUTPUT_LIMIT
+            output = previous + addition
         elif kind == "done":
+            addition = ""
             output = previous
         else:
             return
 
+        if addition:
+            # Preserve the raw full output. Normalize CR/LF only for line events.
+            lines = (pending + addition.replace("\r\n", "\n").replace("\r", "\n")).split("\n")
+            pending = lines.pop()
+            completed_lines.extend(lines)
+
+        if kind == "done" and pending:
+            # Publish an unterminated final line as well.
+            completed_lines.append(pending)
+            pending = ""
+
+        if kind == "snapshot" and event.get("stage") == "running":
+            run = {**run, "status": "running"}
+        if kind == "done" and isinstance(event.get("error_message"), str):
+            run = {**run, "error_message": event["error_message"]}
+
+        next_sequence = sequence + len(completed_lines)
+        if completed_lines:
+            last_line = completed_lines[-1]
         run = {
             **run,
             "_ha_console_output": output,
-            "_ha_console_truncated": truncated,
+            "_ha_console_pending": pending,
+            "_ha_console_last_line": last_line,
+            "_ha_console_line_number": next_sequence,
             "_ha_console_live": kind != "done",
         }
-        if kind == "snapshot" and event.get("stage") == "running":
-            run["status"] = "running"
-        if kind == "done" and isinstance(event.get("error_message"), str):
-            run["error_message"] = event["error_message"]
+        self._run_cache[host_id] = run
+
+        for index, line in enumerate(completed_lines):
+            # A distinct HA sensor state update per line (including duplicates).
+            # The latest line lives in the state; the entire run remains in
+            # console_output for the popup, with no arbitrary tail truncation.
+            line_sequence = sequence + index + 1
+            for listener in tuple(self._console_line_listeners.get(host_id, ())):
+                listener(run_id, line, line_sequence)
 
         if kind != "chunk":
             flush = self._console_flush_tasks.pop(host_id, None)
@@ -296,8 +377,8 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             self.publish_patch_run(host_id, run)
             return
 
-        # Keep bursts of short chunks out of HA Recorder and the WebSocket bus.
-        self._run_cache[host_id] = run
+        # Avoid emitting redundant coordinator updates for every partial chunk.
+        # Completed lines have already notified the sensor immediately.
         existing = self._console_flush_tasks.get(host_id)
         if not existing or existing.done():
             task = self.hass.async_create_background_task(
@@ -344,6 +425,7 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 task.cancel()
             tasks.clear()
         self._stream_run_ids.clear()
+        self._console_line_listeners.clear()
 
     def _clear_task(self, host_id: str, task: asyncio.Task[None]) -> None:
         if self._follow_tasks.get(host_id) is task:

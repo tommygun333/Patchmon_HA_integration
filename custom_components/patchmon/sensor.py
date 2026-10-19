@@ -17,7 +17,7 @@ from homeassistant.util import dt as dt_util
 from .const import PACKAGE_ATTRIBUTE_LIMIT
 from .coordinator import PatchMonCoordinator
 from .entity import PatchMonHostEntity, hub_device_info
-from .patch_utils import CONSOLE_OUTPUT_LIMIT, console_preview, console_tail
+from .patch_utils import console_tail
 
 
 FLEET_SENSORS: dict[str, tuple[str, str, Callable[[dict[str, dict[str, Any]]], int]]] = {
@@ -225,15 +225,31 @@ class PatchMonLastPatchRunSensor(PatchMonHostEntity, SensorEntity):
 
 
 class PatchMonPatchConsoleSensor(PatchMonHostEntity, SensorEntity):
-    """Current/last run's live console for Lovelace/Browser Mod popups."""
+    """One HA state update per completed console line, plus full run output."""
 
     _attr_name = "Patch console"
     _attr_icon = "mdi:console-line"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_force_update = True  # Identical successive log lines still emit changes.
 
     def __init__(self, coordinator: PatchMonCoordinator, host_id: str) -> None:
         super().__init__(coordinator, host_id)
         self._attr_unique_id = f"{coordinator.entry.entry_id}_{host_id}_patch_console"
+        self._line: str | None = None
+        self._line_run_id: str | None = None
+        self._line_sequence: int = 0
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.coordinator.add_console_line_listener(self.host_id, self._on_line)
+        )
+
+    def _on_line(self, run_id: str, line: str, sequence: int) -> None:
+        self._line_run_id = run_id
+        self._line = line
+        self._line_sequence = sequence
+        self.async_write_ha_state()
 
     @property
     def available(self) -> bool:
@@ -241,26 +257,39 @@ class PatchMonPatchConsoleSensor(PatchMonHostEntity, SensorEntity):
 
     @property
     def native_value(self) -> str | None:
-        run = self.host.get("_patch_run") or {}
-        if run.get("_ha_console_live"):
-            return "streaming"
-        return str(run["status"]) if run.get("status") else None
+        run = self.coordinator.console_run(self.host_id)
+        if not run:
+            return None
+        if self._line_run_id == run.get("id") and self._line is not None:
+            value = self._line
+        else:
+            value = run.get("_ha_console_last_line")
+            if value is None:
+                output = run.get("shell_output") or ""
+                value = output.splitlines()[-1] if output.splitlines() else "waiting for output"
+        # Home Assistant sensor states cannot exceed 255 characters.
+        return str(value)[-255:]
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        run = self.host.get("_patch_run")
-        if not isinstance(run, dict) or not run:
+        run = self.coordinator.console_run(self.host_id)
+        if not run:
             return None
-        raw_output = run.get("shell_output")
-        if run.get("_ha_console_live") or not isinstance(raw_output, str):
-            raw_output = run.get("_ha_console_output")
-        output = console_preview(raw_output)
-        full_length = len(raw_output) if isinstance(raw_output, str) else 0
+        output = run.get("_ha_console_output")
+        persisted = run.get("shell_output")
+        if not isinstance(output, str):
+            output = persisted if isinstance(persisted, str) else ""
+        elif isinstance(persisted, str) and persisted.startswith(output):
+            # The terminal REST response may include a final chunk that was
+            # not received on the socket before it closed.
+            output = persisted
+        line = self._line if self._line_run_id == run.get("id") else run.get("_ha_console_last_line")
         return {
             "run_id": run.get("id"),
-            "console_output": output,
+            "line_number": self._line_sequence if self._line_run_id == run.get("id") else run.get("_ha_console_line_number", 0),
+            "line_full": line,
+            "console_output": output,  # Complete run, NOT a rolling preview.
             "console_streaming": bool(run.get("_ha_console_live")),
-            "output_truncated": bool(run.get("_ha_console_truncated")) or full_length > CONSOLE_OUTPUT_LIMIT,
             "update_stage": run.get("_ha_phase") or run.get("status"),
             "error_message": run.get("error_message"),
         }
