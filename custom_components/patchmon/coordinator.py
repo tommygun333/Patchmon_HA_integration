@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 import logging
+import time
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -58,6 +59,8 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._stream_run_ids: dict[str, str] = {}
         self._console_flush_tasks: dict[str, asyncio.Task[None]] = {}
         self._console_line_listeners: dict[str, set] = {}
+        # Temporary timing diagnostics; one entry per host (no console text).
+        self._console_diag_last_rx: dict[str, tuple[str, float]] = {}
         # Register once, not once per submitted run (long-lived HA processes
         # could otherwise accumulate unload callbacks indefinitely).
         entry.async_on_unload(self._cancel_follow_tasks)
@@ -281,6 +284,13 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if not run or run.get("id") != run_id:
             return
         kind = event.get("type")
+        received_at = time.monotonic()
+        last_rx = self._console_diag_last_rx.get(host_id)
+        gap_ms = (
+            round((received_at - last_rx[1]) * 1000)
+            if last_rx is not None and last_rx[0] == run_id else None
+        )
+        self._console_diag_last_rx[host_id] = (run_id, received_at)
         previous = str(run.get("_ha_console_output") or "")
         pending = str(run.get("_ha_console_pending") or "")
         sequence = int(run.get("_ha_console_line_number") or 0)
@@ -362,6 +372,17 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         }
         self._run_cache[host_id] = run
 
+        payload = (event.get("chunk") if kind == "chunk" else
+                   event.get("shell_output") if kind == "snapshot" else "")
+        _LOGGER.debug(
+            "PATCHMON_DIAG rx host=%s run=%s type=%s gap_ms=%s "
+            "payload_chars=%d lines=%d pending_chars=%d",
+            host_id, run_id, kind, gap_ms,
+            len(payload) if isinstance(payload, str) else 0,
+            len(completed_lines), len(pending),
+        )
+        publish_started = time.monotonic()
+
         for index, line in enumerate(completed_lines):
             # A distinct HA sensor state update per line (including duplicates).
             # The latest line lives in the state; the entire run remains in
@@ -369,6 +390,14 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             line_sequence = sequence + index + 1
             for listener in tuple(self._console_line_listeners.get(host_id, ())):
                 listener(run_id, line, line_sequence)
+        if completed_lines:
+            _LOGGER.debug(
+                "PATCHMON_DIAG emitted host=%s run=%s lines=%d "
+                "listeners=%d elapsed_ms=%.1f",
+                host_id, run_id, len(completed_lines),
+                len(self._console_line_listeners.get(host_id, ())),
+                (time.monotonic() - publish_started) * 1000,
+            )
 
         if kind != "chunk":
             flush = self._console_flush_tasks.pop(host_id, None)
@@ -397,6 +426,10 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Reconnect with snapshots if chunks are missed; status poll remains fallback."""
         for attempt in range(4):
             try:
+                _LOGGER.debug(
+                    "PATCHMON_DIAG connect host=%s run=%s attempt=%d",
+                    host_id, run_id, attempt + 1,
+                )
                 async for event in self.client.async_stream_patch_run(run_id):
                     self._apply_console_event(host_id, run_id, event)
                     if event.get("type") == "done":
