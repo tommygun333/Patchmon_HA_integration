@@ -9,10 +9,12 @@ buttons, services, update entities or the coordinator.
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import AsyncIterator
 from http import HTTPStatus
 from typing import Any
 
-from aiohttp import BasicAuth, ClientError, ClientResponse, ClientSession
+from aiohttp import BasicAuth, ClientError, ClientResponse, ClientSession, WSMsgType, WSServerHandshakeError
 
 
 class PatchMonError(Exception):
@@ -122,6 +124,59 @@ class PatchMonClient:
         if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
             raise PatchMonError("PatchMon returned an invalid patch run response")
         return payload
+
+    async def async_stream_patch_run(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
+        """Read PatchMon's authenticated live patch-output WebSocket.
+
+        Each connection sends a snapshot followed by chunks and an optional
+        done event. The caller owns reconnecting if a socket closes early.
+        """
+        if not self.patching_enabled:
+            raise PatchMonAuthenticationError("Patching credentials are not configured")
+
+        for attempt in range(2):
+            if not self._access_token:
+                await self.async_login()
+            token_used = self._access_token
+            try:
+                async with self._session.ws_connect(
+                    f"{self.base_url}/api/v1/patching/runs/{run_id}/stream",
+                    headers={"Authorization": f"Bearer {token_used}"},
+                    ssl=self._verify_ssl,
+                    heartbeat=40,
+                ) as websocket:
+                    async for message in websocket:
+                        if message.type == WSMsgType.ERROR:
+                            raise PatchMonConnectionError("Patch-run WebSocket failed")
+                        if message.type != WSMsgType.TEXT:
+                            continue
+                        try:
+                            event = json.loads(message.data)
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        if event.get("patch_run_id") not in (None, run_id):
+                            continue
+                        if event.get("type") not in ("snapshot", "chunk", "done"):
+                            continue
+                        yield event
+                        if event["type"] == "done":
+                            return
+                    return
+            except WSServerHandshakeError as err:
+                if err.status == 401 and attempt == 0:
+                    async with self._login_lock:
+                        if token_used == self._access_token:
+                            await self._login_unlocked()
+                    continue
+                if err.status == 401:
+                    raise PatchMonAuthenticationError("Patch-run stream authentication failed") from err
+                if err.status == 403:
+                    raise PatchMonPermissionError("Patch-run stream access denied") from err
+                raise PatchMonConnectionError(f"Patch-run stream returned HTTP {err.status}") from err
+            except (ClientError, TimeoutError) as err:
+                raise PatchMonConnectionError(f"Patch-run stream disconnected: {err}") from err
 
     async def async_validate(self) -> None:
         await self.async_get_hosts()

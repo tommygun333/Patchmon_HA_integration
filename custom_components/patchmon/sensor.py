@@ -17,7 +17,7 @@ from homeassistant.util import dt as dt_util
 from .const import PACKAGE_ATTRIBUTE_LIMIT
 from .coordinator import PatchMonCoordinator
 from .entity import PatchMonHostEntity, hub_device_info
-from .patch_utils import console_tail
+from .patch_utils import CONSOLE_OUTPUT_LIMIT, console_preview, console_tail
 
 
 FLEET_SENSORS: dict[str, tuple[str, str, Callable[[dict[str, dict[str, Any]]], int]]] = {
@@ -74,7 +74,10 @@ async def async_setup_entry(
             )
             entities.append(PatchMonLastReportSensor(coordinator, host_id))
             if coordinator.client.patching_enabled:
-                entities.append(PatchMonLastPatchRunSensor(coordinator, host_id))
+                entities.extend((
+                    PatchMonLastPatchRunSensor(coordinator, host_id),
+                    PatchMonPatchConsoleSensor(coordinator, host_id),
+                ))
         known_hosts.update(new_hosts)
         async_add_entities(entities)
 
@@ -212,7 +215,52 @@ class PatchMonLastPatchRunSensor(PatchMonHostEntity, SensorEntity):
             attrs["update_stage"] = run["_ha_phase"]
         # A bounded tail is safe for recorder; full output is available on
         # the PatchMon patch-run detail page.
-        tail = console_tail(run.get("shell_output"))
+        raw_output = run.get("shell_output")
+        if run.get("_ha_console_live") or not isinstance(raw_output, str):
+            raw_output = run.get("_ha_console_output")
+        tail = console_tail(raw_output)
         if tail:
             attrs["console_tail"] = tail
         return attrs
+
+
+class PatchMonPatchConsoleSensor(PatchMonHostEntity, SensorEntity):
+    """Current/last run's live console for Lovelace/Browser Mod popups."""
+
+    _attr_name = "Patch console"
+    _attr_icon = "mdi:console-line"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: PatchMonCoordinator, host_id: str) -> None:
+        super().__init__(coordinator, host_id)
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{host_id}_patch_console"
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.host.get("_patch_run_loaded") is True
+
+    @property
+    def native_value(self) -> str | None:
+        run = self.host.get("_patch_run") or {}
+        if run.get("_ha_console_live"):
+            return "streaming"
+        return str(run["status"]) if run.get("status") else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        run = self.host.get("_patch_run")
+        if not isinstance(run, dict) or not run:
+            return None
+        raw_output = run.get("shell_output")
+        if run.get("_ha_console_live") or not isinstance(raw_output, str):
+            raw_output = run.get("_ha_console_output")
+        output = console_preview(raw_output)
+        full_length = len(raw_output) if isinstance(raw_output, str) else 0
+        return {
+            "run_id": run.get("id"),
+            "console_output": output,
+            "console_streaming": bool(run.get("_ha_console_live")),
+            "output_truncated": bool(run.get("_ha_console_truncated")) or full_length > CONSOLE_OUTPUT_LIMIT,
+            "update_stage": run.get("_ha_phase") or run.get("status"),
+            "error_message": run.get("error_message"),
+        }

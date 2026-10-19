@@ -11,6 +11,16 @@ ACTIVE_RUN_STATUSES = frozenset({
 SUCCESS_RUN_STATUSES = frozenset({"completed", "success", "succeeded"})
 
 
+CONSOLE_OUTPUT_LIMIT = 8192
+
+
+def console_preview(output: Any) -> str:
+    """Bound live stdout/stderr and preserve carriage-return progress updates."""
+    if not isinstance(output, str):
+        return ""
+    return output.replace("\r\n", "\n").replace("\r", "\n")[-CONSOLE_OUTPUT_LIMIT:]
+
+
 def run_matches_package(run: dict[str, Any] | None, package: str) -> bool:
     """Match both patch-all and specifically selected package runs."""
     if not isinstance(run, dict):

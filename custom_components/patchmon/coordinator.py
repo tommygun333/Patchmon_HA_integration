@@ -13,7 +13,10 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import PatchMonAuthenticationError, PatchMonClient, PatchMonError
-from .patch_utils import ACTIVE_RUN_STATUSES, SUCCESS_RUN_STATUSES
+from .patch_utils import (
+    ACTIVE_RUN_STATUSES, CONSOLE_OUTPUT_LIMIT, SUCCESS_RUN_STATUSES,
+    console_preview,
+)
 from .const import (
     CONF_HOST_GROUPS,
     CONF_INCLUDE_PACKAGES,
@@ -52,6 +55,9 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._package_cache: dict[str, list[dict[str, Any]]] = {}
         self._run_cache: dict[str, dict[str, Any]] = {}
         self._follow_tasks: dict[str, asyncio.Task[None]] = {}
+        self._stream_tasks: dict[str, asyncio.Task[None]] = {}
+        self._stream_run_ids: dict[str, str] = {}
+        self._console_flush_tasks: dict[str, asyncio.Task[None]] = {}
         # Register once, not once per submitted run (long-lived HA processes
         # could otherwise accumulate unload callbacks indefinitely).
         entry.async_on_unload(self._cancel_follow_tasks)
@@ -128,6 +134,11 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     # actively following with an unrelated old history entry.
                     task = self._follow_tasks.get(host_id)
                     if not (task and not task.done() and previous_run.get("id") != latest_run.get("id")):
+                        if latest_run.get("id") == previous_run.get("id"):
+                            latest_run = dict(latest_run)
+                            for key in ("_ha_console_output", "_ha_console_truncated", "_ha_console_live"):
+                                if key in previous_run and key not in latest_run:
+                                    latest_run[key] = previous_run[key]
                         self._run_cache[host_id] = latest_run
                     host["_patch_run_loaded"] = True
                 except PatchMonError as err:
@@ -159,6 +170,14 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 host["_patch_run"] = run
                 host["_patch_run_loaded"] = True
 
+            # Also stream PatchMon-initiated runs if run monitoring is enabled.
+            # HA-initiated updates start their stream in _watch_patch_run.
+            if (
+                self.monitor_patch_runs
+                and run and run.get("status") == "running" and run.get("id")
+            ):
+                self._ensure_console_stream(host_id, str(run["id"]))
+
         await asyncio.gather(*(load_host(host_id, host) for host_id, host in host_data.items()))
         # Remove caches for deleted/inaccessible hosts.
         for cache in (self._package_cache, self._run_cache):
@@ -170,7 +189,13 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         return (self.data or {}).get(host_id)
 
     def publish_patch_run(self, host_id: str, run: dict[str, Any]) -> None:
-        """Update the live HA state without awaiting the regular 15-minute poll."""
+        """Publish run and retain streamed logs across ordinary REST polls."""
+        previous = self._run_cache.get(host_id)
+        if previous and previous.get("id") == run.get("id"):
+            run = dict(run)
+            for key in ("_ha_console_output", "_ha_console_truncated", "_ha_console_live"):
+                if key not in run and key in previous:
+                    run[key] = previous[key]
         self._run_cache[host_id] = run
         if self.data and host_id in self.data:
             data = dict(self.data)
@@ -207,10 +232,118 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._follow_tasks[host_id] = task
         task.add_done_callback(lambda completed: self._clear_task(host_id, completed))
 
+    def _ensure_console_stream(self, host_id: str, run_id: str) -> None:
+        """One WebSocket per host/run, including runs started outside HA."""
+        current = self._stream_tasks.get(host_id)
+        if current and not current.done() and self._stream_run_ids.get(host_id) == run_id:
+            return
+        if current and not current.done():
+            current.cancel()
+        self._stream_run_ids[host_id] = run_id
+        task = self.hass.async_create_background_task(
+            self._consume_console_stream(host_id, run_id),
+            f"PatchMon console stream {run_id}",
+        )
+        self._stream_tasks[host_id] = task
+        task.add_done_callback(lambda done: self._clear_stream_task(host_id, done))
+
+    def _clear_stream_task(self, host_id: str, task: asyncio.Task[None]) -> None:
+        if self._stream_tasks.get(host_id) is task:
+            self._stream_tasks.pop(host_id, None)
+            self._stream_run_ids.pop(host_id, None)
+
+    def _apply_console_event(self, host_id: str, run_id: str, event: dict[str, Any]) -> None:
+        """Append live chunks without ever publishing unlimited output to HA."""
+        run = self._run_cache.get(host_id)
+        if not run or run.get("id") != run_id:
+            return
+        kind = event.get("type")
+        previous = str(run.get("_ha_console_output") or "")
+        truncated = bool(run.get("_ha_console_truncated"))
+        if kind == "snapshot":
+            snapshot = event.get("shell_output")
+            if not isinstance(snapshot, str):
+                return
+            output = console_preview(snapshot)
+            truncated = len(snapshot) > CONSOLE_OUTPUT_LIMIT
+        elif kind == "chunk":
+            chunk = event.get("chunk")
+            if not isinstance(chunk, str) or not chunk:
+                return
+            combined = previous + chunk
+            output = console_preview(combined)
+            truncated = truncated or len(combined) > CONSOLE_OUTPUT_LIMIT
+        elif kind == "done":
+            output = previous
+        else:
+            return
+
+        run = {
+            **run,
+            "_ha_console_output": output,
+            "_ha_console_truncated": truncated,
+            "_ha_console_live": kind != "done",
+        }
+        if kind == "snapshot" and event.get("stage") == "running":
+            run["status"] = "running"
+        if kind == "done" and isinstance(event.get("error_message"), str):
+            run["error_message"] = event["error_message"]
+
+        if kind != "chunk":
+            flush = self._console_flush_tasks.pop(host_id, None)
+            if flush and not flush.done():
+                flush.cancel()
+            self.publish_patch_run(host_id, run)
+            return
+
+        # Keep bursts of short chunks out of HA Recorder and the WebSocket bus.
+        self._run_cache[host_id] = run
+        existing = self._console_flush_tasks.get(host_id)
+        if not existing or existing.done():
+            task = self.hass.async_create_background_task(
+                self._flush_console(host_id, run_id),
+                f"PatchMon console flush {run_id}",
+            )
+            self._console_flush_tasks[host_id] = task
+
+    async def _flush_console(self, host_id: str, run_id: str) -> None:
+        await asyncio.sleep(0.75)
+        current = self._run_cache.get(host_id)
+        if current and current.get("id") == run_id:
+            self.publish_patch_run(host_id, current)
+
+    async def _consume_console_stream(self, host_id: str, run_id: str) -> None:
+        """Reconnect with snapshots if chunks are missed; status poll remains fallback."""
+        for attempt in range(4):
+            try:
+                async for event in self.client.async_stream_patch_run(run_id):
+                    self._apply_console_event(host_id, run_id, event)
+                    if event.get("type") == "done":
+                        return
+            except PatchMonAuthenticationError as err:
+                _LOGGER.warning("PatchMon console stream auth failed for %s: %s", run_id, err)
+                break
+            except PatchMonError as err:
+                _LOGGER.debug("PatchMon console stream %s interrupted: %s", run_id, err)
+
+            run = self._run_cache.get(host_id)
+            if not run or run.get("id") != run_id or run.get("status") not in ACTIVE_RUN_STATUSES:
+                break
+            await asyncio.sleep(min(2 ** attempt, 15))
+
+        current = self._run_cache.get(host_id)
+        if current and current.get("id") == run_id:
+            self.publish_patch_run(host_id, {**current, "_ha_console_live": False})
+
     def _cancel_follow_tasks(self) -> None:
         for task in self._follow_tasks.values():
             task.cancel()
         self._follow_tasks.clear()
+        for tasks in (self._stream_tasks, self._console_flush_tasks):
+            for task in tasks.values():
+                task.cancel()
+            tasks.clear()
+        self._stream_run_ids.clear()
 
     def _clear_task(self, host_id: str, task: asyncio.Task[None]) -> None:
         if self._follow_tasks.get(host_id) is task:
@@ -251,6 +384,8 @@ class PatchMonCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             except PatchMonError as err:
                 _LOGGER.debug("Cannot refresh PatchMon run %s: %s", run_id, err)
                 continue
+            if run.get("status") == "running":
+                self._ensure_console_stream(host_id, run_id)
             if run.get("status") not in ACTIVE_RUN_STATUSES:
                 terminal = run
                 if run.get("status") in SUCCESS_RUN_STATUSES:
