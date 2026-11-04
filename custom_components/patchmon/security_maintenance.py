@@ -1,8 +1,7 @@
-"""Read-only security maintenance planning and PatchMon dry-run validation.
+"""Security-update selection and native PatchMon validation helpers.
 
-IMPORTANT: PatchMon's patch_package action chooses APT's latest candidate and may
-upgrade regular-channel packages or dependencies. Never use that action as a
-strict security-only executor, even after a successful dry-run.
+An eligible security flag selects the *initial package name*. The agent may
+install newer candidate versions and additional dependencies, by design.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from typing import Any
 # The upstream PatchMon patch_package endpoint has a 100-package limit.
 MAX_PACKAGES_PER_VALIDATION = 100
 PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+_.:-]{0,199}$")
-VALIDATION_OK = frozenset({"validated", "dry_run_completed"})
+VALIDATION_OK = frozenset({"validated"})
 VALIDATION_TERMINAL = VALIDATION_OK | frozenset(
     {"completed", "approved", "failed", "cancelled", "timed_out", "agent_disconnected"}
 )
@@ -43,8 +42,8 @@ def prepare_security_plan(
 ) -> dict[str, Any]:
     """Return an auditable plan without scheduling or installing anything.
 
-    A package is eligible for *validation* only with an explicit true security
-    flag. It is NEVER automatically safe to install through patch_package.
+    Only explicit security-flagged names are selected as primary targets.
+    Dependencies and later versions may be installed by the package manager.
     """
     host = host or {}
     now = now or datetime.now(timezone.utc)
@@ -109,9 +108,8 @@ def prepare_security_plan(
         "reboot_required": bool(host.get("needs_reboot")),
         "errors": errors,
         "execution_note": (
-            "Validation does not authorize installation: PatchMon patch_package "
-            "may install regular-origin versions and dependencies. Use a separately "
-            "verified security-repository-restricted updater."
+            "Package selection is security-flagged, not repository-restricted. "
+            "PatchMon may install newer versions and required dependencies."
         ),
     }
 
@@ -132,14 +130,10 @@ async def validate_security_plan(
     client: Any,
     plan: dict[str, Any],
     *,
-    timeout_seconds: int = 240,
+    timeout_seconds: int = 1800,
     poll_seconds: int = 5,
 ) -> dict[str, Any]:
-    """Simulate a single selected-package PatchMon run; NEVER execute patches.
-
-    The validation can expose non-security upgrades, but it cannot prove that
-    a subsequent patch_package execution would stay within security channels.
-    """
+    """Simulate an explicitly selected list using the PatchMon agent."""
     if plan["state"] != "ready":
         return {"status": "skipped", "reason": plan["state"], "success": False}
 
@@ -158,16 +152,22 @@ async def validate_security_plan(
     deadline = loop.time() + timeout_seconds
     while True:
         run = await client.async_get_patch_run(run_id)
+        if run.get("id") not in (None, run_id):
+            return {"status": "failed", "success": False, "run_id": run_id,
+                    "reason": "PatchMon returned a different run"}
         status = str(run.get("status") or "unknown")
         if status in VALIDATION_TERMINAL:
             extras = _extra_packages(run, set(names))
+            removals = apt_removals(run.get("shell_output"))
             return {
                 "status": status,
-                "success": status in VALIDATION_OK,
+                "success": status in VALIDATION_OK and not removals,
                 "run_id": run_id,
                 "extra_dependencies": extras,
+                "removals": removals,
                 "execution_safe": False,
-                "reason": str(run.get("error_message") or "")[:400],
+                "reason": (str(run.get("error_message") or "") or
+                           ("Simulation proposes package removals" if removals else ""))[:400],
             }
         remaining = deadline - loop.time()
         if remaining <= 0:
@@ -179,3 +179,15 @@ async def validate_security_plan(
                 "reason": "PatchMon run is still pending; no packages were installed by this action",
             }
         await asyncio.sleep(min(poll_seconds, remaining))
+
+
+def apt_removals(shell_output: Any) -> list[str]:
+    """Conservatively flag APT's `-s` removals (preflight policy: fail closed)."""
+    if not isinstance(shell_output, str):
+        return []
+    found = []
+    for line in shell_output.splitlines():
+        if line.startswith("Remv "):
+            name = line.split()[1] if len(line.split()) > 1 else "unknown"
+            found.append(name)
+    return sorted(set(found))

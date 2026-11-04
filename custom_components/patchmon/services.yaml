@@ -62,29 +62,39 @@ get_host_updates:
         text:
 
 security_maintenance:
-  name: Security maintenance (plan and validate)
+  name: Security maintenance
   description: >-
-    Read security-flagged updates and optionally run sequential PatchMon dry-run
-    validation. NEVER installs packages. A validated PatchMon run does not prove
-    that unrestricted APT patching would be security-only.
+    Select security-flagged packages per host, validate with PatchMon, and
+    optionally approve/install in the supplied host order. The installer may
+    upgrade newer versions and required dependencies. Default is validation only.
   fields:
     config_entry_id:
       name: PatchMon server
-      description: Required only when multiple PatchMon servers are configured.
       selector:
         config_entry:
           integration: patchmon
     host_ids:
-      name: Host IDs
-      description: PatchMon host UUIDs in validation order (Proxmox first).
+      name: Ordered PatchMon host IDs
       required: true
-      example:
-        - 550e8400-e29b-41d4-a716-446655440000
+      description: Enter Proxmox first, then LXCs, then PBS. Exclude OPNsense unless explicitly tested.
       selector:
         text:
           multiple: true
-    validate:
-      name: Run PatchMon dry-run validation
+    mode:
+      name: Run mode
+      description: Only install triggers actual package changes.
+      default: validate
+      selector:
+        select:
+          options:
+            - label: Plan only
+              value: plan
+            - label: Validate (dry-run)
+              value: validate
+            - label: Validate and install
+              value: install
+    stop_on_failure:
+      name: Stop on failed host
       default: true
       selector:
         boolean:
@@ -98,6 +108,37 @@ security_maintenance:
           mode: box
     notify:
       name: Persistent notification report
+      default: true
+      selector:
+        boolean:
+
+validate_patch_all:
+  name: Validate pending updates before manual Patch all
+  description: >-
+    Uses PatchMon's selected-package dry-run on current pending packages.
+    Does NOT run the unsupported native Linux patch_all dry-run and does not
+    install packages. The actual Patch all remains a separate manual action.
+  fields:
+    config_entry_id:
+      name: PatchMon server
+      selector:
+        config_entry:
+          integration: patchmon
+    host_id:
+      name: Host ID
+      required: true
+      selector:
+        text:
+    max_report_age_minutes:
+      name: Maximum inventory age (minutes)
+      default: 120
+      selector:
+        number:
+          min: 5
+          max: 1440
+          mode: box
+    notify:
+      name: Persistent notification
       default: true
       selector:
         boolean:

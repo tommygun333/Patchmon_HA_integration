@@ -1,0 +1,293 @@
+"""Async REST client for PatchMon.
+
+The private ``_patch_request`` method is the sole authentication boundary for
+PatchMon's user-facing patching API. Once PatchMon PR #596 ships, support for a
+long-lived ``patchmon_at_`` bearer token can be added *there* without changing
+buttons, services, update entities or the coordinator.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator
+from http import HTTPStatus
+from typing import Any
+
+from aiohttp import BasicAuth, ClientError, ClientResponse, ClientSession, WSMsgType, WSServerHandshakeError
+
+
+class PatchMonError(Exception):
+    """Base PatchMon client error."""
+
+
+class PatchMonConnectionError(PatchMonError):
+    """The PatchMon server could not be reached."""
+
+
+class PatchMonAuthenticationError(PatchMonError):
+    """PatchMon rejected the supplied credentials."""
+
+
+class PatchMonPermissionError(PatchMonError):
+    """The credentials lack permission."""
+
+
+class PatchMonTwoFactorRequired(PatchMonAuthenticationError):
+    """The account requires interactive two-factor authentication."""
+
+
+class PatchMonClient:
+    """Client for the scoped inventory API and authenticated patching API."""
+
+    def __init__(
+        self,
+        session: ClientSession,
+        base_url: str,
+        api_id: str,
+        api_key: str,
+        *,
+        verify_ssl: bool = True,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
+        self._session = session
+        self.base_url = self.normalize_url(base_url)
+        self._basic_auth = BasicAuth(api_id, api_key)
+        self._verify_ssl = verify_ssl
+        self._username = username or None
+        self._password = password or None
+        self._access_token: str | None = None
+        self._login_lock = asyncio.Lock()
+
+    @staticmethod
+    def normalize_url(url: str) -> str:
+        normalized = url.strip().rstrip("/")
+        for suffix in ("/api/v1", "/api"):
+            if normalized.endswith(suffix):
+                normalized = normalized[: -len(suffix)]
+                break
+        return normalized.rstrip("/")
+
+    @property
+    def patching_enabled(self) -> bool:
+        """Whether the currently supported patch auth is configured."""
+        return bool(self._username and self._password)
+
+    async def async_get_hosts(self, host_groups: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, str] = {"include": "stats"}
+        if host_groups:
+            params["hostgroup"] = host_groups
+        payload = await self._request("GET", "/api/v1/api/hosts", auth="basic", params=params)
+        hosts = payload.get("hosts") if isinstance(payload, dict) else None
+        if not isinstance(hosts, list):
+            raise PatchMonError("PatchMon returned an invalid hosts response")
+        return [host for host in hosts if isinstance(host, dict) and host.get("id")]
+
+    async def async_get_packages(
+        self, host_id: str, *, updates_only: bool = True
+    ) -> list[dict[str, Any]]:
+        """Fetch pending updates or the full installed package list."""
+        payload = await self._request(
+            "GET",
+            f"/api/v1/api/hosts/{host_id}/packages",
+            auth="basic",
+            params={"updates_only": "true" if updates_only else "false"},
+        )
+        packages = payload.get("packages") if isinstance(payload, dict) else None
+        if not isinstance(packages, list):
+            raise PatchMonError("PatchMon returned an invalid packages response")
+        return [package for package in packages if isinstance(package, dict)]
+
+    async def async_get_updates(self, host_id: str) -> list[dict[str, Any]]:
+        return await self.async_get_packages(host_id, updates_only=True)
+
+    async def async_get_patch_runs(
+        self, host_id: str, *, limit: int = 1
+    ) -> list[dict[str, Any]]:
+        """Get actual patch runs, rather than unrelated agent queue jobs."""
+        if not self.patching_enabled:
+            raise PatchMonAuthenticationError("Patching credentials are not configured")
+        payload = await self._patch_request(
+            "GET", "/api/v1/patching/runs", params={"host_id": host_id, "limit": max(1, min(limit, 200))}
+        )
+        runs = payload.get("runs") if isinstance(payload, dict) else None
+        if not isinstance(runs, list):
+            raise PatchMonError("PatchMon returned an invalid patch runs response")
+        return [run for run in runs if isinstance(run, dict)]
+
+    async def async_get_patch_run(self, run_id: str) -> dict[str, Any]:
+        """Read patch-run status and console output from the user API."""
+        if not self.patching_enabled:
+            raise PatchMonAuthenticationError("Patching credentials are not configured")
+        payload = await self._patch_request("GET", f"/api/v1/patching/runs/{run_id}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+            raise PatchMonError("PatchMon returned an invalid patch run response")
+        return payload
+
+    async def async_stream_patch_run(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
+        """Read PatchMon's authenticated live patch-output WebSocket.
+
+        Each connection sends a snapshot followed by chunks and an optional
+        done event. The caller owns reconnecting if a socket closes early.
+        """
+        if not self.patching_enabled:
+            raise PatchMonAuthenticationError("Patching credentials are not configured")
+
+        for attempt in range(2):
+            if not self._access_token:
+                await self.async_login()
+            token_used = self._access_token
+            try:
+                async with self._session.ws_connect(
+                    f"{self.base_url}/api/v1/patching/runs/{run_id}/stream",
+                    headers={"Authorization": f"Bearer {token_used}"},
+                    ssl=self._verify_ssl,
+                    heartbeat=40,
+                ) as websocket:
+                    async for message in websocket:
+                        if message.type == WSMsgType.ERROR:
+                            raise PatchMonConnectionError("Patch-run WebSocket failed")
+                        if message.type != WSMsgType.TEXT:
+                            continue
+                        try:
+                            event = json.loads(message.data)
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        if event.get("patch_run_id") not in (None, run_id):
+                            continue
+                        if event.get("type") not in ("snapshot", "chunk", "done"):
+                            continue
+                        yield event
+                        if event["type"] == "done":
+                            return
+                    return
+            except WSServerHandshakeError as err:
+                if err.status == 401 and attempt == 0:
+                    async with self._login_lock:
+                        if token_used == self._access_token:
+                            await self._login_unlocked()
+                    continue
+                if err.status == 401:
+                    raise PatchMonAuthenticationError("Patch-run stream authentication failed") from err
+                if err.status == 403:
+                    raise PatchMonPermissionError("Patch-run stream access denied") from err
+                raise PatchMonConnectionError(f"Patch-run stream returned HTTP {err.status}") from err
+            except (ClientError, TimeoutError) as err:
+                raise PatchMonConnectionError(f"Patch-run stream disconnected: {err}") from err
+
+    async def async_validate(self) -> None:
+        await self.async_get_hosts()
+        if self.patching_enabled:
+            await self.async_login()
+
+    async def async_login(self) -> None:
+        """Create a short-lived user session for the current patch backend."""
+        if not self.patching_enabled:
+            raise PatchMonAuthenticationError("Patching credentials are not configured")
+        async with self._login_lock:
+            await self._login_unlocked()
+
+    async def _login_unlocked(self) -> None:
+        payload = await self._request(
+            "POST", "/api/v1/auth/login", auth=None,
+            json={"username": self._username, "password": self._password}
+        )
+        if payload.get("requiresTfa"):
+            raise PatchMonTwoFactorRequired(
+                "This PatchMon account requires two-factor authentication"
+            )
+        token = payload.get("token") or payload.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise PatchMonAuthenticationError("PatchMon did not return an access token")
+        self._access_token = token
+
+    async def async_patch_host(
+        self,
+        host_id: str,
+        *,
+        package_names: list[str] | None = None,
+        dry_run: bool = False,
+        pending_approval: bool = False,
+        run_immediately: bool = False,
+    ) -> dict[str, Any]:
+        if not self.patching_enabled:
+            raise PatchMonAuthenticationError(
+                "Configure PatchMon user credentials to enable patching"
+            )
+        packages = [name.strip() for name in package_names or [] if name.strip()]
+        if dry_run and not packages:
+            raise PatchMonError("PatchMon supports dry runs only when package_names are supplied")
+        body: dict[str, Any] = {
+            "host_id": host_id,
+            "patch_type": "patch_package" if packages else "patch_all",
+            "dry_run": dry_run,
+            "pending_approval": pending_approval,
+        }
+        if packages:
+            body["package_names"] = packages
+        if run_immediately:
+            body["schedule_override"] = "immediate"
+        return await self._patch_request("POST", "/api/v1/patching/trigger", json=body)
+
+    async def _patch_request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        """Patching auth boundary; swap to long-lived bearer tokens after PR #596."""
+        return await self._user_request(method, path, **kwargs)
+
+    async def _user_request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        """Make a JWT-authenticated request and retry after an expired session."""
+        if not self._access_token:
+            await self.async_login()
+        token_used = self._access_token
+        try:
+            return await self._request(method, path, auth="bearer", **kwargs)
+        except PatchMonAuthenticationError:
+            # Multiple concurrent 401s must not cause a stampede of logins.
+            async with self._login_lock:
+                if token_used == self._access_token:
+                    self._access_token = None
+                    await self._login_unlocked()
+            return await self._request(method, path, auth="bearer", **kwargs)
+
+    async def _request(self, method: str, path: str, *, auth: str | None, **kwargs: Any) -> dict[str, Any]:
+        headers = dict(kwargs.pop("headers", {}))
+        request_auth = None
+        if auth == "basic":
+            request_auth = self._basic_auth
+        elif auth == "bearer":
+            headers["Authorization"] = f"Bearer {self._access_token}"
+        try:
+            async with asyncio.timeout(30):
+                response = await self._session.request(
+                    method, f"{self.base_url}{path}", auth=request_auth,
+                    headers=headers, ssl=self._verify_ssl, **kwargs
+                )
+                return await self._handle_response(response)
+        except TimeoutError as err:
+            raise PatchMonConnectionError("Timed out connecting to PatchMon") from err
+        except ClientError as err:
+            raise PatchMonConnectionError(f"Could not connect to PatchMon: {err}") from err
+
+    @staticmethod
+    async def _handle_response(response: ClientResponse) -> dict[str, Any]:
+        try:
+            payload: Any = await response.json(content_type=None)
+        except (ValueError, ClientError):
+            payload = {}
+        message = ""
+        if isinstance(payload, dict):
+            message = str(payload.get("error") or payload.get("message") or "")
+        message = message or f"PatchMon returned HTTP {response.status}"
+        if response.status == HTTPStatus.UNAUTHORIZED:
+            raise PatchMonAuthenticationError(message)
+        if response.status == HTTPStatus.FORBIDDEN:
+            raise PatchMonPermissionError(message)
+        if response.status == HTTPStatus.TOO_MANY_REQUESTS:
+            raise PatchMonError(f"PatchMon rate limit reached: {message}")
+        if response.status >= HTTPStatus.BAD_REQUEST:
+            raise PatchMonError(message)
+        if not isinstance(payload, dict):
+            raise PatchMonError("PatchMon returned a non-object JSON response")
+        return payload

@@ -33,7 +33,12 @@ async def async_setup_entry(
         if not new_hosts:
             return
         async_add_entities(
-            PatchMonPatchAllButton(coordinator, host_id) for host_id in new_hosts
+            entity
+            for host_id in new_hosts
+            for entity in (
+                PatchMonPatchAllButton(coordinator, host_id),
+                PatchMonValidatePendingButton(coordinator, host_id),
+            )
         )
         known_hosts.update(new_hosts)
 
@@ -88,3 +93,42 @@ class PatchMonPatchAllButton(PatchMonHostEntity, ButtonEntity):
         # An immediate inventory refresh would still contain the old versions.
         # The watcher waits for the agent's post-patch inventory report.
         self.coordinator.follow_patch(self.host_id, None, result)
+
+
+class PatchMonValidatePendingButton(PatchMonHostEntity, ButtonEntity):
+    """Manual dry-run of pending selected packages, no automatic installation."""
+
+    _attr_name = "Validate pending updates"
+    _attr_icon = "mdi:clipboard-check-outline"
+
+    def __init__(self, coordinator: PatchMonCoordinator, host_id: str) -> None:
+        super().__init__(coordinator, host_id)
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{host_id}_validate_pending"
+        self._active_task = None
+
+    async def async_press(self) -> None:
+        """Start preflight in the background so HA button presses return promptly."""
+        if self._active_task is not None and not self._active_task.done():
+            raise HomeAssistantError("Manual update preflight already running")
+        run = self.host.get("_patch_run") or {}
+        if run.get("status") in ACTIVE_RUN_STATUSES:
+            raise HomeAssistantError("A PatchMon patch run is already active")
+
+        async def run_preflight() -> None:
+            try:
+                await self.hass.services.async_call(
+                    "patchmon", "validate_patch_all", {"host_id": self.host_id},
+                    blocking=True, return_response=True,
+                )
+            except Exception as exc:
+                from homeassistant.components import persistent_notification
+                persistent_notification.async_create(
+                    self.hass,
+                    f"Preflight failed: {exc}",
+                    title="PatchMon manual update preflight",
+                    notification_id=f"patchmon_preflight_{self.host_id}",
+                )
+
+        self._active_task = self.hass.async_create_background_task(
+            run_preflight(), f"PatchMon preflight {self.host_id}",
+        )

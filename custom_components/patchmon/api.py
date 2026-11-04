@@ -232,6 +232,17 @@ class PatchMonClient:
             body["schedule_override"] = "immediate"
         return await self._patch_request("POST", "/api/v1/patching/trigger", json=body)
 
+    async def async_approve_patch_run(
+        self, validation_run_id: str, *, run_immediately: bool = True,
+    ) -> dict[str, Any]:
+        """Approve a completed PatchMon validation (server creates new install run)."""
+        if not self.patching_enabled:
+            raise PatchMonAuthenticationError("Patching credentials are not configured")
+        body = {"schedule_override": "immediate"} if run_immediately else {}
+        return await self._patch_request(
+            "POST", f"/api/v1/patching/runs/{validation_run_id}/approve", json=body,
+        )
+
     async def _patch_request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         """Patching auth boundary; swap to long-lived bearer tokens after PR #596."""
         return await self._user_request(method, path, **kwargs)
