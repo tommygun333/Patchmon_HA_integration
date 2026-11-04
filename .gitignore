@@ -1,0 +1,14 @@
+
+
+# Generated files and local maintenance overlays
+__pycache__/
+*.py[cod]
+*.bak
+*.orig
+*.rej
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/

@@ -32,5 +32,8 @@ jobs:
       - name: Verify integration Python syntax
         run: python -m compileall -q custom_components/patchmon
 
+      - name: Validate dashboard card JavaScript syntax
+        run: node --check custom_components/patchmon/www/patchmon-security-report-card.js
+
       - name: Run all unit tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v

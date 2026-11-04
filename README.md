@@ -123,3 +123,60 @@ The exact entity ID depends on your HA host/device name and can be read under **
 ## Development
 
 Run `python -m compileall -q custom_components/patchmon` and `python -m unittest discover -s tests -p 'test_api_v02.py' -v`. Test the config flow, package Install actions and run sensors against a nonproduction PatchMon instance before using the integration for critical machines.
+
+## Security maintenance, reports, and dashboard history
+
+PatchMon's native agent and patch-validation API power both **automatic security-flagged updates** and **manual patch-all preflight**. No PatchMon fork, `unattended-upgrades`, or host-side maintenance script is required.
+
+- **Security maintenance** (`patchmon.security_maintenance`) accepts `mode: plan`, `mode: validate`, or `mode: install`. The install mode validates each host's selected security-flagged packages, approves the successful PatchMon validation run, waits for installation, then checks the refreshed host inventory. Newer candidate versions and required dependencies are allowed. Normal packages are not selected as primary targets. Hosts are processed in the specified order; `stop_on_failure` defaults to `true`.
+- **Manual updates** still have **Patch all packages** and **Validate pending updates** buttons. The latter simulates currently pending named packages; it is not an exact Linux `patch_all` simulation because upstream PatchMon does not permit that dry-run type.
+- **Persistent history** retains the latest 26 completed install cycles (not merely the most recent notification), latest per-host report, validation/installation IDs, package/version snapshots, errors, health-check results, and reboot flags. Saved data lives in Home Assistant `.storage`, not long Recorder attributes.
+- **Dashboard card** supports attention (unread note, expands to details), viewer (newest-first fleet history), and host-specific modes. Acknowledging a report hides its unread indicator, **not** its history.
+- **Safety**: configure real backup-success timestamps and backup-idle checks before enabling weekly installation. Missing/stale backups fail closed when `require_backup_checks: true`. No automatic reboot. Interrupted runs are reconciled using PatchMon IDs and never automatically approved a second time.
+
+### Home Assistant examples
+
+Register dashboard JavaScript resource **`/patchmon-security-reports/patchmon-security-report-card.js`** as type **JavaScript module**, then add:
+
+```yaml
+# Attention card: add to your dashboard's attention stack
+- type: custom:patchmon-security-report-card
+  mode: attention
+  title: Weekly security maintenance
+  hide_when_read: true
+
+# Full fleet history card (always visible)
+- type: custom:patchmon-security-report-card
+  mode: viewer
+  title: Security maintenance history
+  limit: 26
+
+# Per-host card (replace with the host's PatchMon UUID)
+- type: custom:patchmon-security-report-card
+  mode: host
+  host_id: "04ed663f-7b47-434e-9408-76b48a45fc22"
+  title: Lab security updates
+```
+
+For Developer Tools → Actions, run a read-only plan first:
+
+```yaml
+action: patchmon.security_maintenance
+data:
+  host_ids:
+    - "YOUR_PATCHMON_HOST_UUID"
+  mode: plan
+  notify: true
+```
+
+The full documentation is in **[Security maintenance and reporting](docs/security-maintenance.md)**, with copyable examples for [dashboard cards](docs/examples/dashboard_cards.yaml), [manual actions](docs/examples/manual_actions.yaml), and the [weekly 03:30 automation](docs/examples/weekly_security_automation.yaml). **The scheduled installation example is disabled until you replace all placeholder UUIDs and configure actual backup and health entities.**
+
+### Run tests and validation
+
+```bash
+python3 -m compileall -q custom_components/patchmon
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+node --check custom_components/patchmon/www/patchmon-security-report-card.js
+```
+
+GitHub Actions runs the Python tests on 3.12 and 3.13 plus HACS/hassfest validation. The repository excludes `*.bak` and `__pycache__` artifacts: use Git history rather than committed local backups for rollback.

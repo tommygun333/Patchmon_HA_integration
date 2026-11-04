@@ -1,0 +1,31 @@
+# Developer Tools > Actions > YAML; use one action at a time.
+# 1. Plan-only inventory (will not start PatchMon patch runs):
+action: patchmon.security_maintenance
+data:
+  mode: plan
+  host_ids:
+    - "<PATCHMON_HOST_UUID>"
+  notify: false
+
+# 2. Change mode: plan to validate for a native PatchMon dry-run.
+#    It never installs.
+# 3. Change mode: validate to install for the full security package cycle.
+#    It will install after successful validation. Test only on a noncritical host.
+
+# 4. Inspect completed cycle summaries (as a separate action):
+# action: patchmon.get_security_reports
+# data:
+#   limit: 26
+
+# 5. Load a complete saved report by UUID (separate action):
+# action: patchmon.get_security_reports
+# data:
+#   report_id: "<REPORT_ID>"
+
+# 6. Mark the latest cycle as read (separate action):
+# action: patchmon.acknowledge_security_report
+# data: {}
+
+# 7. Observe/reconcile previously interrupted cycle (separate action):
+# action: patchmon.reconcile_security_reports
+# data: {}

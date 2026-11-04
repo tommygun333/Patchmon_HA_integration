@@ -1,0 +1,53 @@
+# 1. Settings -> Dashboards -> Resources -> Add resource:
+#    URL: /patchmon-security-reports/patchmon-security-report-card.js
+#    Type: JavaScript module
+# The integration serves the resource after HA restart.
+# YAML resource mode alternative (if you already use resource_mode: yaml):
+# lovelace:
+#   resource_mode: yaml
+#   resources:
+#     - url: /patchmon-security-reports/patchmon-security-report-card.js
+#       type: module
+
+# 2. Add this card inside your existing Attention card / vertical-stack:
+# You can add it directly as a child card.
+- type: custom:patchmon-security-report-card
+  mode: attention
+  title: Weekly security maintenance
+  hide_when_read: true
+  # config_entry_id: "<PATCHMON_HA_CONFIG_ENTRY_ID>"   # if multiple PatchMon servers
+  # unread_entity: binary_sensor.<actual_patchmon_entity_id>
+
+# 3. Alternative: built-in Conditional card to show only when unread.
+# Replace the entity ID with the one HA actually created.
+- type: conditional
+  conditions:
+    - condition: state
+      entity: binary_sensor.<actual_security_report_unread_entity>
+      state: "on"
+  card:
+    type: custom:patchmon-security-report-card
+    mode: attention
+    title: Security updates finished
+    hide_when_read: false
+
+# 4. Add the full report viewer to a dedicated Security page/dashboard:
+- type: custom:patchmon-security-report-card
+  mode: viewer
+  title: PatchMon security maintenance history
+  limit: 26
+
+# 5. Add a per-host card (replace with PatchMon host UUID):
+- type: custom:patchmon-security-report-card
+  mode: host
+  title: Proxmox security update history
+  host_id: "<PATCHMON_PROXMOX_HOST_UUID>"
+  limit: 26
+
+# 6. Optional built-in Entity card alongside the custom cards:
+# type: entities
+# title: PatchMon attention
+# entities:
+#   - entity: binary_sensor.<actual_security_report_unread_entity>
+#   - entity: sensor.<actual_patchmon_server_last_security_maintenance_entity>
+#   - entity: sensor.<actual_proxmox_last_security_maintenance_entity>

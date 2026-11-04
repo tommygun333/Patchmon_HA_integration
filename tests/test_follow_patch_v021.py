@@ -37,6 +37,11 @@ def load_coordinator_module():
     api.PatchMonError = PatchMonError
     api.PatchMonAuthenticationError = PatchMonAuthenticationError
     api.PatchMonClient = object
+    # The real coordinator now imports host_cleanup; load a minimal isolated
+    # fake to avoid importing the Home Assistant entity registry in unit tests.
+    host_cleanup = types.ModuleType(f"{pkg}.host_cleanup")
+    host_cleanup.prune_missing_hosts = lambda *a, **kw: None
+    host_cleanup.registered_host_ids = lambda *a, **kw: set()
     const = types.ModuleType(f"{pkg}.const")
     for key, val in {
         "CONF_HOST_GROUPS": "host_groups", "CONF_INCLUDE_PACKAGES": "include_packages",
@@ -59,6 +64,7 @@ def load_coordinator_module():
     uc.UpdateFailed = type("UpdateFailed", (Exception,), {})
     modules = {
         pkg: package, f"{pkg}.api": api, f"{pkg}.const": const,
+        f"{pkg}.host_cleanup": host_cleanup,
         "homeassistant": ha, "homeassistant.config_entries": entries,
         "homeassistant.core": core, "homeassistant.exceptions": exceptions,
         "homeassistant.helpers": helpers, "homeassistant.helpers.update_coordinator": uc,

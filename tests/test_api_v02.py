@@ -31,6 +31,10 @@ except ModuleNotFoundError as err:
     aiohttp.ClientError = ClientError
     aiohttp.ClientResponse = object
     aiohttp.ClientSession = object
+    class WSServerHandshakeError(ClientError):
+        status = 401
+    aiohttp.WSServerHandshakeError = WSServerHandshakeError
+    aiohttp.WSMsgType = types.SimpleNamespace(TEXT='TEXT', ERROR='ERROR')
     sys.modules["aiohttp"] = aiohttp
 
 

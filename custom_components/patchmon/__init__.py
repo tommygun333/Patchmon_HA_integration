@@ -41,6 +41,8 @@ from .reporting_runtime import (
 )
 from .report_websocket import register_websocket
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
 SERVICE_ENTRY_ID = "config_entry_id"
 SERVICE_SECURITY_MAINTENANCE = "security_maintenance"
 SECURITY_REPORT_EVENT = "patchmon_security_maintenance_report"

@@ -26,6 +26,12 @@ aiohttp.BasicAuth = BasicAuth
 aiohttp.ClientError = ClientError
 aiohttp.ClientResponse = object
 aiohttp.ClientSession = object
+# The REST client also imports WebSocket symbols, even in HTTP-only tests.
+class WSServerHandshakeError(ClientError):
+    status = 401
+
+aiohttp.WSServerHandshakeError = WSServerHandshakeError
+aiohttp.WSMsgType = types.SimpleNamespace(TEXT='TEXT', ERROR='ERROR')
 sys.modules.setdefault("aiohttp", aiohttp)
 
 API_PATH = Path(__file__).parents[1] / "custom_components" / "patchmon" / "api.py"
@@ -137,6 +143,25 @@ class PatchMonClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["patch_type"], "patch_package")
         self.assertEqual(body["package_names"], ["openssl", "nginx"])
         self.assertTrue(body["dry_run"])
+
+    async def test_approve_completed_validation_run(self) -> None:
+        session = FakeSession(
+            FakeResponse(200, {"token": "jwt-token"}),
+            FakeResponse(200, {
+                "patch_run_id": "installation-run-id",
+                "validation_run_id": "validation-run-id",
+            }),
+        )
+        client = api.PatchMonClient(
+            session, "https://patchmon.test", "id", "secret",
+            username="ha", password="password",
+        )
+        result = await client.async_approve_patch_run("validation-run-id")
+        self.assertEqual(result["validation_run_id"], "validation-run-id")
+        method, url, data = session.requests[-1]
+        self.assertEqual(method, "POST")
+        self.assertTrue(url.endswith("/patching/runs/validation-run-id/approve"))
+        self.assertEqual(data["json"], {"schedule_override": "immediate"})
 
     async def test_authentication_error_is_translated(self) -> None:
         session = FakeSession(FakeResponse(401, {"error": "bad credentials"}))

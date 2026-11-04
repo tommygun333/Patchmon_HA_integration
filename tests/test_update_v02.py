@@ -46,6 +46,7 @@ class FakeCoordinator:
         self.follow_patch = unittest.mock.Mock()
         self.tracked_packages = {"h-1": ("openssl",)}
         self.data = {"h-1": self._host}
+        self.removed_host_ids = frozenset()
 
     def watched_packages(self, host_id):
         return self.tracked_packages.get(host_id, ())
