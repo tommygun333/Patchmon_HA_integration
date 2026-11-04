@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
 import voluptuous as vol
@@ -13,6 +15,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.components import persistent_notification
 
 from .api import PatchMonClient, PatchMonError
 from .const import (
@@ -29,8 +32,11 @@ from .const import (
     SERVICE_PATCH_HOST,
 )
 from .coordinator import PatchMonCoordinator
+from .security_maintenance import prepare_security_plan, validate_security_plan
 
 SERVICE_ENTRY_ID = "config_entry_id"
+SERVICE_SECURITY_MAINTENANCE = "security_maintenance"
+SECURITY_REPORT_EVENT = "patchmon_security_maintenance_report"
 
 PATCH_HOST_SCHEMA = vol.Schema(
     {
@@ -47,6 +53,19 @@ GET_UPDATES_SCHEMA = vol.Schema(
     {
         vol.Optional(SERVICE_ENTRY_ID): cv.string,
         vol.Required(ATTR_HOST_ID): cv.string,
+    }
+)
+
+
+SECURITY_MAINTENANCE_SCHEMA = vol.Schema(
+    {
+        vol.Optional(SERVICE_ENTRY_ID): cv.string,
+        vol.Required("host_ids"): vol.All(cv.ensure_list, [cv.string], vol.Length(min=1, max=30)),
+        vol.Optional("validate", default=True): cv.boolean,
+        vol.Optional("max_report_age_minutes", default=120): vol.All(
+            vol.Coerce(int), vol.Range(min=5, max=1440)
+        ),
+        vol.Optional("notify", default=True): cv.boolean,
     }
 )
 
@@ -147,6 +166,117 @@ def _register_services(hass: HomeAssistant) -> None:
             "packages": packages,
         }
 
+    async def security_maintenance(call: ServiceCall) -> dict[str, Any]:
+        """Plan security updates and optionally validate them; never install."""
+        coordinator = _coordinator_for_call(hass, call)
+        lock = hass.data.setdefault(DOMAIN, {}).setdefault(
+            "security_maintenance_lock", asyncio.Lock()
+        )
+        if lock.locked():
+            raise ServiceValidationError("A PatchMon security maintenance run is already active")
+
+        async with lock:
+            started = datetime.now(timezone.utc).isoformat()
+            host_results: list[dict[str, Any]] = []
+            for host_id in dict.fromkeys(call.data["host_ids"]):
+                host = coordinator.host(host_id)
+                try:
+                    if not host:
+                        raise ValueError("Host is not present in the current PatchMon inventory")
+                    packages = await coordinator.client.async_get_updates(host_id)
+                    plan = prepare_security_plan(
+                        host_id, host, packages,
+                        max_report_age_minutes=call.data["max_report_age_minutes"],
+                    )
+                    if plan["state"] == "ready" and call.data["validate"]:
+                        try:
+                            plan["validation"] = await validate_security_plan(
+                                coordinator.client, plan,
+                            )
+                        except (PatchMonError, asyncio.TimeoutError) as err:
+                            plan["validation"] = {
+                                "status": "failed", "success": False,
+                                "reason": str(err)[:400],
+                            }
+                    else:
+                        plan["validation"] = {
+                            "status": "skipped", "success": False,
+                            "reason": "Validation disabled" if not call.data["validate"] else plan["state"],
+                        }
+                except (PatchMonError, ValueError) as err:
+                    plan = {
+                        "host_id": host_id, "hostname": str((host or {}).get("hostname") or host_id),
+                        "state": "blocked", "security_count": 0, "regular_count": 0,
+                        "execution_safe": False, "errors": [str(err)[:400]],
+                        "validation": {"status": "skipped", "success": False},
+                    }
+                host_results.append(plan)
+
+            summary = {
+                "hosts": len(host_results),
+                "ready": sum(p["state"] == "ready" for p in host_results),
+                "no_security_updates": sum(
+                    p["state"] == "no_security_updates" for p in host_results
+                ),
+                "blocked": sum(p["state"] == "blocked" for p in host_results),
+                "validated": sum(
+                    p["validation"].get("success") is True for p in host_results
+                ),
+                "failed_validation": sum(
+                    p["validation"].get("status") not in ("skipped", "validated", "dry_run_completed")
+                    for p in host_results
+                ),
+            }
+            report = {
+                "started_at": started,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "config_entry_id": coordinator.entry.entry_id,
+                "mode": "validation" if call.data["validate"] else "plan_only",
+                "installed_packages": 0,
+                "execution_safe": False,
+                "summary": summary,
+                "hosts": host_results,
+            }
+            # The action response is the complete structured report. Emit a
+            # Recorder-visible event and a brief persistent notification too.
+            hass.bus.async_fire(SECURITY_REPORT_EVENT, {
+                "started_at": started,
+                "completed_at": report["completed_at"],
+                "mode": report["mode"],
+                "summary": summary,
+                "hosts": [
+                    {
+                        "host_id": item["host_id"],
+                        "hostname": item["hostname"],
+                        "state": item["state"],
+                        "security_count": item["security_count"],
+                        "validation_status": item["validation"]["status"],
+                        "validation_run_id": item["validation"].get("run_id"),
+                    }
+                    for item in host_results
+                ],
+            })
+            if call.data["notify"]:
+                lines = [
+                    f"**PatchMon security maintenance (validation only)**",
+                    f"Hosts: {summary['hosts']}, validated: {summary['validated']}, "
+                    f"no security updates: {summary['no_security_updates']}, "
+                    f"blocked: {summary['blocked']}, validation errors: {summary['failed_validation']}.",
+                    "No packages were installed. Security-only execution is not yet configured.",
+                ]
+                for plan in host_results:
+                    lines.append(
+                        f"- {plan['hostname']}: {plan['state']} "
+                        f"({plan['security_count']} security; "
+                        f"validation: {plan['validation']['status']})"
+                    )
+                persistent_notification.async_create(
+                    hass, "\n".join(lines),
+                    title="PatchMon security maintenance report",
+                    notification_id="patchmon_security_maintenance",
+                )
+            return report
+
     hass.services.async_register(
         DOMAIN,
         SERVICE_PATCH_HOST,
@@ -159,5 +289,13 @@ def _register_services(hass: HomeAssistant) -> None:
         SERVICE_GET_HOST_UPDATES,
         get_host_updates,
         schema=GET_UPDATES_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SECURITY_MAINTENANCE,
+        security_maintenance,
+        schema=SECURITY_MAINTENANCE_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )

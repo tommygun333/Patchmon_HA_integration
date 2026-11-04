@@ -60,3 +60,44 @@ get_host_updates:
       example: 550e8400-e29b-41d4-a716-446655440000
       selector:
         text:
+
+security_maintenance:
+  name: Security maintenance (plan and validate)
+  description: >-
+    Read security-flagged updates and optionally run sequential PatchMon dry-run
+    validation. NEVER installs packages. A validated PatchMon run does not prove
+    that unrestricted APT patching would be security-only.
+  fields:
+    config_entry_id:
+      name: PatchMon server
+      description: Required only when multiple PatchMon servers are configured.
+      selector:
+        config_entry:
+          integration: patchmon
+    host_ids:
+      name: Host IDs
+      description: PatchMon host UUIDs in validation order (Proxmox first).
+      required: true
+      example:
+        - 550e8400-e29b-41d4-a716-446655440000
+      selector:
+        text:
+          multiple: true
+    validate:
+      name: Run PatchMon dry-run validation
+      default: true
+      selector:
+        boolean:
+    max_report_age_minutes:
+      name: Maximum inventory age (minutes)
+      default: 120
+      selector:
+        number:
+          min: 5
+          max: 1440
+          mode: box
+    notify:
+      name: Persistent notification report
+      default: true
+      selector:
+        boolean:
