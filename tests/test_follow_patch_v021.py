@@ -113,8 +113,15 @@ class FollowPatchTests(unittest.IsolatedAsyncioTestCase):
             published.append((run.get("status"), run.get("_ha_phase")))
             publish(host_id, run)
         coordinator.publish_patch_run = track_publish
-        with patch.object(mod.asyncio, "sleep", new_callable=AsyncMock):
+        # This test exercises inventory verification, not Home Assistant's
+        # asynchronous WebSocket console streaming. The fake hass object has
+        # no async_create_background_task(), so mock only the stream launcher.
+        with (
+            patch.object(mod.asyncio, "sleep", new_callable=AsyncMock),
+            patch.object(coordinator, "_ensure_console_stream") as ensure_stream,
+        ):
             await coordinator._watch_patch_run("h-1", "openssl", "run-1")
+        ensure_stream.assert_called_once_with("h-1", "run-1")
         self.assertEqual(published, [
             ("running", None), ("completed", "verifying"), ("completed", "completed")
         ])
