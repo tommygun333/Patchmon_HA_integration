@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Awaitable
 
 from .security_maintenance import (
     MAX_PACKAGES_PER_VALIDATION,
@@ -102,8 +102,26 @@ async def verify_post_patch(
                                     if p.get("name") in selected_names
                                     and p.get("needs_update", True)})
                 online = host.get("effective_status") not in ("offline", "inactive")
+                # Read installed versions after the agent's fresh post-patch report.
+                # The complete inventory is fetched for each updated host, but only
+                # selected names are retained in the report.
+                installed_versions: dict[str, str | None] = {}
+                version_error = None
+                try:
+                    installed = await client.async_get_packages(host_id, updates_only=False)
+                    installed_versions = {
+                        p["name"]: p.get("current_version")
+                        for p in installed
+                        if p.get("name") in selected_names
+                    }
+                except Exception as exc:
+                    version_error = str(exc)[:200]
+                missing = sorted(set(selected_names) - set(installed_versions))
                 return {
-                    "status": "verified" if not remaining and online else "needs_attention",
+                    "installed_versions_after": installed_versions,
+                    "missing_selected_packages": missing,
+                    "version_inventory_error": version_error,
+                    "status": "verified" if not remaining and online and not missing and not version_error else "needs_attention",
                     "remaining_selected_packages": remaining,
                     "reboot_required": bool(host.get("needs_reboot")),
                     "host_status": host.get("effective_status"),
@@ -120,6 +138,9 @@ async def run_security_maintenance(
     max_report_age_minutes: int = 120, stop_on_failure: bool = True,
     validation_timeout_seconds: int = 1800, install_timeout_seconds: int = 1800,
     progress: Callable[[dict[str, Any]], None] | None = None,
+    checkpoint: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    health_check: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
+    report_id: str | None = None,
 ) -> dict[str, Any]:
     """Sequential hosts: plan -> native dry-run -> optionally approve -> verify.
 
@@ -132,9 +153,13 @@ async def run_security_maintenance(
         raise ValueError("Supply 1-30 unique host IDs")
 
     report: dict[str, Any] = {
-        "started_at": _utc(), "mode": mode, "hosts": [], "summary": {},
+        "report_id": report_id, "started_at": _utc(), "mode": mode,
+        "requested_host_ids": list(host_ids),
+        "status": "running", "hosts": [], "summary": {},
         "selection_policy": "security-flagged primary packages; dependency upgrades allowed",
     }
+    if checkpoint:
+        await checkpoint(report)
     aborted = False
     for host_id in host_ids:
         if aborted:
@@ -142,6 +167,8 @@ async def run_security_maintenance(
             continue
         entry: dict[str, Any] = {"host_id": host_id, "state": "running"}
         report["hosts"].append(entry)
+        if checkpoint:
+            await checkpoint(report)
         try:
             hosts = await client.async_get_hosts()
             host = next((h for h in hosts if str(h.get("id")) == host_id), None)
@@ -151,13 +178,26 @@ async def run_security_maintenance(
             plan = prepare_security_plan(host_id, host, packages,
                                          max_report_age_minutes=max_report_age_minutes)
             entry.update(plan)
+            # The old read-only planner exposed execution_safe=False to mean
+            # "not strictly security-repository-only". That is not our agreed
+            # policy and is misleading in successful install reports.
+            entry.pop("execution_safe", None)
             if plan["state"] != "ready":
                 if plan["state"] == "blocked":
                     aborted = stop_on_failure
                 continue
             if mode == "plan":
                 continue
+            if mode == "install" and health_check:
+                entry["pre_health"] = await health_check(host_id, "before")
+                if entry["pre_health"].get("status") == "failed":
+                    entry["state"] = "health_precheck_failed"
+                    aborted = stop_on_failure
+                    continue
 
+            entry["state"] = "validating"
+            if checkpoint:
+                await checkpoint(report)
             validation = await validate_security_plan(
                 client, plan, timeout_seconds=validation_timeout_seconds,
             )
@@ -167,6 +207,8 @@ async def run_security_maintenance(
                 aborted = stop_on_failure
                 continue
             entry["state"] = "validated"
+            if checkpoint:
+                await checkpoint(report)
             if mode == "validate":
                 continue
 
@@ -174,6 +216,11 @@ async def run_security_maintenance(
             validation_id = validation.get("run_id")
             if not isinstance(validation_id, str) or not validation_id:
                 raise ValueError("Validation completed without a run ID")
+            # Persist uncertainty BEFORE sending approval. If HA crashes at
+            # this boundary, recovery must NOT blindly approve a second time.
+            entry["state"] = "approving"
+            if checkpoint:
+                await checkpoint(report)
             approved = await approve_validated_run(
                 client, validation_id, patch_type="patch_package", names=names,
             )
@@ -184,6 +231,8 @@ async def run_security_maintenance(
                 "status": "running",
             }
             entry["state"] = "installing"
+            if checkpoint:
+                await checkpoint(report)
             if progress:
                 progress(entry)
             completed = await wait_for_status(
@@ -195,6 +244,8 @@ async def run_security_maintenance(
                 "error": completed.get("error_message"),
                 "packages_affected": completed.get("packages_affected"),
             })
+            if checkpoint:
+                await checkpoint(report)
             if completed.get("status") != "completed":
                 entry["state"] = "installation_failed"
                 aborted = stop_on_failure
@@ -203,6 +254,10 @@ async def run_security_maintenance(
                 client, host_id, plan.get("last_report"), names,
             )
             entry["state"] = entry["verification"]["status"]
+            if health_check:
+                entry["post_health"] = await health_check(host_id, "after")
+                if entry["post_health"].get("status") == "failed":
+                    entry["state"] = "needs_attention"
             if entry["state"] != "verified":
                 aborted = stop_on_failure
         except Exception as exc:
@@ -210,12 +265,14 @@ async def run_security_maintenance(
             entry["error"] = str(exc)[:500]
             aborted = stop_on_failure
         finally:
+            if checkpoint:
+                await checkpoint(report)
             if progress:
                 progress(entry)
 
     states = [h["state"] for h in report["hosts"]]
     failures = {"blocked", "validation_failed", "installation_failed", "failed",
-                "needs_attention", "unverified"}
+                "needs_attention", "unverified", "health_precheck_failed"}
     report["summary"] = {
         "hosts": len(states), "verified": states.count("verified"),
         "validated": states.count("validated"),
@@ -224,7 +281,8 @@ async def run_security_maintenance(
         "blocked": states.count("blocked"),
         "failed": sum(s in failures for s in states),
         "not_started": states.count("not_started"),
-        "reboot_required": sum(bool(h.get("verification", {}).get("reboot_required")) for h in report["hosts"]),
+        "reboot_required": sum(bool(h.get("verification", {}).get("reboot_required")
+                                    or h.get("reboot_required")) for h in report["hosts"]),
     }
     report["completed_at"] = _utc()
     report["status"] = "needs_attention" if report["summary"]["failed"] or report["summary"]["not_started"] else "completed"

@@ -18,6 +18,7 @@ from .const import PACKAGE_ATTRIBUTE_LIMIT
 from .coordinator import PatchMonCoordinator
 from .entity import PatchMonHostEntity, hub_device_info
 from .patch_utils import console_tail
+from .maintenance_entities import PatchMonSecurityCycleSensor, PatchMonHostSecurityCycleSensor
 
 
 FLEET_SENSORS: dict[str, tuple[str, str, Callable[[dict[str, dict[str, Any]]], int]]] = {
@@ -59,6 +60,7 @@ async def async_setup_entry(
         PatchMonFleetSensor(coordinator, key, name, icon, value_fn)
         for key, (name, icon, value_fn) in FLEET_SENSORS.items()
     )
+    async_add_entities([PatchMonSecurityCycleSensor(coordinator)])
     known_hosts: set[str] = set()
 
     @callback
@@ -74,6 +76,7 @@ async def async_setup_entry(
                 for key, (name, icon, field) in HOST_NUMBER_SENSORS.items()
             )
             entities.append(PatchMonLastReportSensor(coordinator, host_id))
+            entities.append(PatchMonHostSecurityCycleSensor(coordinator, host_id))
             if coordinator.client.patching_enabled:
                 entities.extend((
                     PatchMonLastPatchRunSensor(coordinator, host_id),

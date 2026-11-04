@@ -112,6 +112,45 @@ security_maintenance:
       selector:
         boolean:
 
+    require_backup_checks:
+      name: Require completed backups before installation
+      description: Fail closed unless fresh successful backup(s) and idle checks are configured.
+      default: false
+      selector:
+        boolean:
+    backup_checks:
+      name: Backup success checks
+      description: >-
+        List of entity_id, expected_state, timestamp_attribute, and max_age_hours.
+        For weekly installation set require_backup_checks true.
+      example:
+        - entity_id: binary_sensor.proxmox_backup_success
+          expected_state: 'on'
+          timestamp_attribute: last_success
+          max_age_hours: 30
+      selector:
+        object:
+    backup_idle_checks:
+      name: Backup idle checks
+      example:
+        - entity_id: binary_sensor.proxmox_backup_running
+          expected_state: 'off'
+      selector:
+        object:
+    health_checks:
+      name: Host service health checks
+      description: Mapping of PatchMon host UUID to HA entity checks (expected_state).
+      selector:
+        object:
+    health_timeout_seconds:
+      name: Post-install health recovery timeout
+      default: 120
+      selector:
+        number:
+          min: 5
+          max: 600
+          mode: box
+
 validate_patch_all:
   name: Validate pending updates before manual Patch all
   description: >-
@@ -140,5 +179,70 @@ validate_patch_all:
     notify:
       name: Persistent notification
       default: true
+      selector:
+        boolean:
+
+get_security_reports:
+  name: Get saved security maintenance reports
+  description: List recent completed cycles, or pass report_id for the full report.
+  fields:
+    config_entry_id:
+      name: PatchMon server
+      selector:
+        config_entry:
+          integration: patchmon
+    report_id:
+      name: Report ID (for full detail)
+      selector:
+        text:
+    host_id:
+      name: Filter reports by host ID
+      selector:
+        text:
+    limit:
+      name: Number of reports
+      default: 26
+      selector:
+        number:
+          min: 1
+          max: 26
+          mode: box
+
+acknowledge_security_report:
+  name: Acknowledge latest security maintenance report
+  description: Clears the unread attention indicator; retains the full history.
+  fields:
+    config_entry_id:
+      name: PatchMon server
+      selector:
+        config_entry:
+          integration: patchmon
+    report_id:
+      name: Latest report ID (optional)
+      selector:
+        text:
+
+reconcile_security_reports:
+  name: Recover interrupted security maintenance
+  description: Read existing PatchMon runs after HA restart. Never approves or starts installs.
+  fields:
+    config_entry_id:
+      name: PatchMon server
+      selector:
+        config_entry:
+          integration: patchmon
+
+resolve_interrupted_security_cycle:
+  name: Manually close unresolved interrupted security cycle
+  description: Only after confirming no PatchMon installation is active. Leaves an attention report.
+  fields:
+    config_entry_id:
+      name: PatchMon server
+      selector:
+        config_entry:
+          integration: patchmon
+    confirm_no_active_patch_runs:
+      name: I verified no patch runs are active
+      required: true
       selector:
         boolean:

@@ -33,6 +33,13 @@ from .const import (
 )
 from .coordinator import PatchMonCoordinator
 from .maintenance_workflow import run_security_maintenance, validate_pending_updates
+from pathlib import Path
+from homeassistant.components.http import StaticPathConfig
+from .reporting_runtime import (
+    setup_reporting, run_reporting_maintenance, register_report_services,
+    extend_maintenance_schema,
+)
+from .report_websocket import register_websocket
 
 SERVICE_ENTRY_ID = "config_entry_id"
 SERVICE_SECURITY_MAINTENANCE = "security_maintenance"
@@ -70,6 +77,8 @@ SECURITY_MAINTENANCE_SCHEMA = vol.Schema(
     }
 )
 
+SECURITY_MAINTENANCE_SCHEMA = extend_maintenance_schema(SECURITY_MAINTENANCE_SCHEMA)
+
 PATCH_ALL_PREFLIGHT_SCHEMA = vol.Schema(
     {
         vol.Optional(SERVICE_ENTRY_ID): cv.string,
@@ -95,6 +104,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = PatchMonCoordinator(hass, entry, client)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
+    await setup_reporting(hass, coordinator)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
     return True
@@ -138,6 +148,15 @@ def _coordinator_for_call(hass: HomeAssistant, call: ServiceCall) -> PatchMonCoo
 async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
     """Set up PatchMon actions."""
     _register_services(hass)
+    register_report_services(hass, _coordinator_for_call)
+    register_websocket(hass)
+    await hass.http.async_register_static_paths([
+        StaticPathConfig(
+            "/patchmon-security-reports",
+            str(Path(__file__).parent / "www"),
+            False,
+        ),
+    ])
     return True
 
 
@@ -184,74 +203,13 @@ def _register_services(hass: HomeAssistant) -> None:
         )
 
     async def security_maintenance(call: ServiceCall) -> dict[str, Any]:
-        """Plan, validate, or approve/install security-selected package runs."""
+        """Run maintenance with persistent history, preflight and health checks."""
         coordinator = _coordinator_for_call(hass, call)
         lock = _maintenance_lock(coordinator)
         if lock.locked():
             raise ServiceValidationError("PatchMon maintenance already active on this server")
-
-        def progress(host_result: dict[str, Any]) -> None:
-            hass.bus.async_fire("patchmon_security_maintenance_progress", {
-                "host_id": host_result["host_id"],
-                "state": host_result["state"],
-                "validation_run_id": host_result.get("validation", {}).get("run_id"),
-                "installation_run_id": host_result.get("installation", {}).get("run_id"),
-            })
-            installation = host_result.get("installation", {})
-            install_id = installation.get("run_id")
-            if install_id and host_result["state"] == "installing":
-                # Existing coordinator follows the new installation run for
-                # HA progress/console sensors. Only start it once per run.
-                followed = hass.data.setdefault(DOMAIN, {}).setdefault("followed_runs", set())
-                if install_id not in followed:
-                    followed.add(install_id)
-                    coordinator.follow_patch(
-                        host_result["host_id"],
-                        [p["name"] for p in host_result["security_packages"]],
-                        {"patch_run_id": install_id},
-                    )
-
         async with lock:
-            report = await run_security_maintenance(
-                coordinator.client, call.data["host_ids"],
-                mode=call.data.get("mode") or (
-                    "validate" if call.data.get("validate", True) else "plan"
-                ),
-                max_report_age_minutes=call.data["max_report_age_minutes"],
-                stop_on_failure=call.data["stop_on_failure"],
-                progress=progress,
-            )
-            report["config_entry_id"] = coordinator.entry.entry_id
-            hass.bus.async_fire(SECURITY_REPORT_EVENT, {
-                "started_at": report["started_at"],
-                "completed_at": report["completed_at"],
-                "mode": report["mode"],
-                "status": report["status"],
-                "summary": report["summary"],
-                "hosts": [
-                    {"host_id": h["host_id"], "state": h["state"],
-                     "validation_run_id": h.get("validation", {}).get("run_id"),
-                     "installation_run_id": h.get("installation", {}).get("run_id")}
-                    for h in report["hosts"]
-                ],
-            })
-            if call.data["notify"]:
-                summary = report["summary"]
-                lines = [
-                    f"**Security maintenance ({report['mode']})** — {report['status']}",
-                    f"Hosts: {summary['hosts']}, verified: {summary['verified']}, "
-                    f"validated: {summary['validated']}, skipped (no security updates): "
-                    f"{summary['no_security_updates']}, failures: {summary['failed']}, "
-                    f"not started: {summary['not_started']}, reboots needed: {summary['reboot_required']}.",
-                ]
-                for h in report["hosts"]:
-                    lines.append(f"- {h.get('hostname') or h['host_id']}: {h['state']} "
-                                 f"({h.get('security_count', 0)} selected)")
-                persistent_notification.async_create(
-                    hass, "\n".join(lines), title="PatchMon security maintenance",
-                    notification_id="patchmon_security_maintenance",
-                )
-            return report
+            return await run_reporting_maintenance(hass, coordinator, call.data)
 
     async def validate_patch_all(call: ServiceCall) -> dict[str, Any]:
         """Manual selected-package preflight; NEVER executes Patch all."""
