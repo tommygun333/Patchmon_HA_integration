@@ -1,7 +1,7 @@
 """Small HA report entities. Full report details are stored separately, not in Recorder."""
 from __future__ import annotations
 
-from homeassistant.components.binary_sensor import BinarySensorEntity, BinarySensorDeviceClass
+from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import EntityCategory
 
@@ -57,9 +57,10 @@ class PatchMonSecurityCycleSensor(_ReportListener, SensorEntity):
 
 
 class PatchMonSecurityReportUnread(_ReportListener, BinarySensorEntity):
+    """Compatibility unread indicator for automatic maintenance reports only."""
+
     _attr_has_entity_name = True
     _attr_name = "Security maintenance report unread"
-    _attr_device_class = BinarySensorDeviceClass.PROBLEM
     _attr_icon = "mdi:shield-alert-outline"
 
     def __init__(self, coordinator):
@@ -72,14 +73,16 @@ class PatchMonSecurityReportUnread(_ReportListener, BinarySensorEntity):
 
     @property
     def is_on(self):
-        return self.coordinator.maintenance_reports.unread
+        return self.coordinator.maintenance_reports.automation_unread
 
     @property
     def extra_state_attributes(self):
-        latest = self.coordinator.maintenance_reports.latest()
+        latest = self.coordinator.maintenance_reports.latest(
+            report_source="automation"
+        )
         return {
             "report_id": latest.get("report_id") if latest else None,
-            "report_source": latest.get("report_source") if latest else None,
+            "report_source": "automation",
         }
 
 
@@ -88,7 +91,6 @@ class PatchMonAutomationReportUnread(_ReportListener, BinarySensorEntity):
 
     _attr_has_entity_name = True
     _attr_translation_key = "automation_security_report_unread"
-    _attr_device_class = BinarySensorDeviceClass.PROBLEM
     _attr_icon = "mdi:shield-sync-outline"
 
     def __init__(self, coordinator):

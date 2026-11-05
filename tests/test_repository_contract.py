@@ -56,6 +56,17 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('_attr_name = "Last agent inventory"', source)
         self.assertNotIn('_attr_name = "Last report"', source)
 
+    def test_report_unread_entities_are_automatic_informational_indicators(self):
+        source = (COMP / 'maintenance_entities.py').read_text()
+        unread_entities = source.split(
+            'class PatchMonSecurityReportUnread', 1
+        )[1].split('class PatchMonHostSecurityCycleSensor', 1)[0]
+        self.assertNotIn('_attr_device_class', unread_entities)
+        self.assertEqual(
+            unread_entities.count('maintenance_reports.automation_unread'), 2
+        )
+        self.assertNotIn('maintenance_reports.unread', unread_entities)
+
 
 if __name__ == '__main__':
     unittest.main()
