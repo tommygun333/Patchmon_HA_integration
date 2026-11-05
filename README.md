@@ -110,6 +110,35 @@ target:
 
 The exact entity ID depends on your HA host/device name and can be read under **Settings -> Devices & services -> PatchMon**.
 
+### Automatic security update host picker
+
+Go to **Settings → Devices & services → PatchMon → Configure → Automatic security updates**.
+Select approved hosts by friendly name in four ordered groups: Proxmox → standard LXCs/VMs → critical hosts → PBS. A host can be selected once. Saving the selection does **not** start any updates.
+
+The weekly `patchmon.security_maintenance` action can omit `host_ids` to use this saved opt-in selection. Explicit `host_ids` still override it for manual calls. Empty or stale automatic selections fail closed. A newly discovered host is never added without your approval. OPNsense is not supported by this APT-oriented workflow.
+
+```yaml
+# This is the action only; the full scheduled example is in docs/examples/.
+action: patchmon.security_maintenance
+data:
+  mode: install
+  require_backup_checks: true
+  backup_checks:
+    - entity_id: binary_sensor.patchmon_pbs_ready
+      expected_state: "on"
+      timestamp_attribute: last_success
+      max_age_hours: 6
+    - entity_id: binary_sensor.patchmon_vzdump_ready
+      expected_state: "on"
+      timestamp_attribute: last_success
+      max_age_hours: 6
+  backup_idle_checks:
+    - entity_id: binary_sensor.patchmon_vzdump_idle
+      expected_state: "on"
+```
+
+Backup entities and `last_success` attributes must exist and be verified before enabling installation. See `docs/examples/weekly_security_automation.yaml`.
+
 ## API load and security
 
 - One scoped host-list request per poll.

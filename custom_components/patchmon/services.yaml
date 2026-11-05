@@ -74,9 +74,10 @@ security_maintenance:
         config_entry:
           integration: patchmon
     host_ids:
-      name: Ordered PatchMon host IDs
-      required: true
-      description: Enter Proxmox first, then LXCs, then PBS. Exclude OPNsense unless explicitly tested.
+      name: Ordered PatchMon host IDs (manual override)
+      description: >-
+        Optional. Leave empty to use hosts chosen under PatchMon > Configure >
+        Automatic security updates. Explicit IDs override saved choices.
       selector:
         text:
           multiple: true

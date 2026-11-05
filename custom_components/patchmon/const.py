@@ -12,6 +12,7 @@ CONF_INCLUDE_PACKAGES = "include_packages"
 CONF_SCAN_INTERVAL = "scan_interval"
 CONF_TRACKED_PACKAGES = "tracked_packages"
 CONF_MONITOR_PATCH_RUNS = "monitor_patch_runs"
+CONF_AUTO_SECURITY_HOSTS = "auto_security_hosts"
 
 DEFAULT_SCAN_INTERVAL = 15
 DEFAULT_INCLUDE_PACKAGES = True

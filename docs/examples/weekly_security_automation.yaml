@@ -1,63 +1,50 @@
-# Home Assistant automations.yaml example — do not enable until backup and
-# health-check entity IDs are real and tests pass. No PatchMon fork needed.
+# Home Assistant automations.yaml: choose PatchMon hosts via
+# Settings -> Devices & services -> PatchMon -> Configure -> Automatic security updates.
+# Start disabled. Verify backup sensors and configure the host list first.
 - id: patchmon_weekly_security_maintenance
   alias: PatchMon weekly security maintenance
-  description: >-
-    Start after nightly backups, update Proxmox then LXCs and PBS in order,
-    retain 26 cycles and show an unread report on dashboard.
-  enabled: false  # IMPORTANT: enable only after confirming backup evidence
+  description: Validate, install and verify the explicitly opted-in hosts in order.
+  enabled: false
   triggers:
     - trigger: time
-      at: "03:30:00"
+      at: "03:50:00"
   conditions:
     - condition: time
       weekday:
         - sun
   actions:
+    # Wait for the nightly VZDump and PBS verification to finish.
+    # If timed out, PatchMon still runs preflight so a blocked cycle is reported.
+    - wait_template: >-
+        {{ is_state('binary_sensor.patchmon_pbs_ready', 'on')
+           and is_state('binary_sensor.patchmon_vzdump_ready', 'on')
+           and is_state('binary_sensor.patchmon_vzdump_idle', 'on') }}
+      timeout: "00:20:00"
+      continue_on_timeout: true
     - action: patchmon.security_maintenance
       data:
+        # host_ids intentionally omitted: uses the selected hosts from
+        # the integration's Automatic security updates options screen.
+        # Set config_entry_id here only if multiple PatchMon servers configured.
         mode: install
-        host_ids:
-          - "<PATCHMON_PROXMOX_HOST_UUID>"
-          - "<PATCHMON_NONCRITICAL_LXC_UUID>"
-          - "<PATCHMON_CRITICAL_LXC_UUID>"
-          - "<PATCHMON_PBS_UUID>"
         stop_on_failure: true
         max_report_age_minutes: 120
         notify: true
         require_backup_checks: true
         backup_checks:
-          # Must expose a *real* timestamp for last completed successful backup.
-          - entity_id: binary_sensor.proxmox_backup_success
+          - entity_id: binary_sensor.patchmon_pbs_ready
             expected_state: "on"
             timestamp_attribute: last_success
-            max_age_hours: 30
-          # Add PBS success if its jobs are part of your safety gate:
-          - entity_id: binary_sensor.pbs_backup_success
+            max_age_hours: 6
+          - entity_id: binary_sensor.patchmon_vzdump_ready
             expected_state: "on"
             timestamp_attribute: last_success
-            max_age_hours: 30
+            max_age_hours: 6
         backup_idle_checks:
-          - entity_id: binary_sensor.proxmox_backup_running
-            expected_state: "off"
-          - entity_id: binary_sensor.pbs_backup_running
-            expected_state: "off"
-        health_timeout_seconds: 180
-        health_checks:
-          "<PATCHMON_NONCRITICAL_LXC_UUID>":
-            - entity_id: binary_sensor.<actual_uptime_kuma_health_entity>
-              expected_state: "on"
-          "<PATCHMON_CRITICAL_LXC_UUID>":
-            - entity_id: binary_sensor.<actual_critical_service_health_entity>
-              expected_state: "on"
+          - entity_id: binary_sensor.patchmon_vzdump_idle
+            expected_state: "on"
+        # Optional: per-host health checks still use PatchMon host UUID keys.
+        # health_checks: {}
       response_variable: patchmon_cycle
-    # Optional custom mobile notification, only if you know your notify target:
-    # - action: notify.mobile_app_your_phone
-    #   data:
-    #     message: >-
-    #       Weekly PatchMon: {{ patchmon_cycle.status }}.
-    #       {{ patchmon_cycle.summary.verified }} hosts verified,
-    #       {{ patchmon_cycle.summary.failed }} failed,
-    #       {{ patchmon_cycle.summary.reboot_required }} pending reboot.
   mode: single
   max_exceeded: warning

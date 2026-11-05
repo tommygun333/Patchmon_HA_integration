@@ -26,12 +26,14 @@ from .const import (
     ATTR_RUN_IMMEDIATELY,
     CONF_API_ID,
     CONF_API_KEY,
+    CONF_AUTO_SECURITY_HOSTS,
     DOMAIN,
     PLATFORMS,
     SERVICE_GET_HOST_UPDATES,
     SERVICE_PATCH_HOST,
 )
 from .coordinator import PatchMonCoordinator
+from .maintenance_selection import selected_maintenance_host_ids
 from .maintenance_workflow import run_security_maintenance, validate_pending_updates
 from pathlib import Path
 from homeassistant.components.http import StaticPathConfig
@@ -69,7 +71,7 @@ GET_UPDATES_SCHEMA = vol.Schema(
 SECURITY_MAINTENANCE_SCHEMA = vol.Schema(
     {
         vol.Optional(SERVICE_ENTRY_ID): cv.string,
-        vol.Required("host_ids"): vol.All(cv.ensure_list, [cv.string], vol.Length(min=1, max=30)),
+        vol.Optional("host_ids"): vol.All(cv.ensure_list, [cv.string], vol.Length(min=1, max=30)),
         vol.Optional("mode"): vol.In(("plan", "validate", "install")),
         vol.Optional("validate"): cv.boolean,  # backwards-compatible old flag
         vol.Optional("stop_on_failure", default=True): cv.boolean,
@@ -211,7 +213,18 @@ def _register_services(hass: HomeAssistant) -> None:
         if lock.locked():
             raise ServiceValidationError("PatchMon maintenance already active on this server")
         async with lock:
-            return await run_reporting_maintenance(hass, coordinator, call.data)
+            data = dict(call.data)
+            if "host_ids" not in data:
+                # No implicit patch-all or dynamic inclusion of newly discovered
+                # hosts. A removed host blocks the *entire* automatic run.
+                try:
+                    data["host_ids"] = selected_maintenance_host_ids(
+                        coordinator.entry.options.get(CONF_AUTO_SECURITY_HOSTS),
+                        known_host_ids=set((coordinator.data or {}).keys()),
+                    )
+                except ValueError as err:
+                    raise ServiceValidationError(str(err)) from err
+            return await run_reporting_maintenance(hass, coordinator, data)
 
     async def validate_patch_all(call: ServiceCall) -> dict[str, Any]:
         """Manual selected-package preflight; NEVER executes Patch all."""

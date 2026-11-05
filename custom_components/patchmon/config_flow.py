@@ -33,6 +33,7 @@ from .api import (
 from .const import (
     CONF_API_ID,
     CONF_API_KEY,
+    CONF_AUTO_SECURITY_HOSTS,
     CONF_HOST_GROUPS,
     CONF_INCLUDE_PACKAGES,
     CONF_MONITOR_PATCH_RUNS,
@@ -45,6 +46,8 @@ from .const import (
     MAX_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
 )
+
+from .maintenance_selection import MAINTENANCE_STAGES, validate_maintenance_groups
 
 
 def _valid_url(value: Any) -> str:
@@ -169,7 +172,7 @@ class PatchMonOptionsFlow(OptionsFlow):
 
     async def async_step_init(self, user_input=None) -> ConfigFlowResult:
         return self.async_show_menu(
-            step_id="init", menu_options=["general", "tracked_packages"]
+            step_id="init", menu_options=["general", "tracked_packages", "security_maintenance"]
         )
 
     async def async_step_general(
@@ -196,6 +199,77 @@ class PatchMonOptionsFlow(OptionsFlow):
             vol.Optional(CONF_HOST_GROUPS, default=current.get(CONF_HOST_GROUPS, "")): str,
         })
         return self.async_show_form(step_id="general", data_schema=schema)
+
+    async def async_step_security_maintenance(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Opt in hosts by friendly name; four stages define safe update order."""
+        coordinator = self.config_entry.runtime_data
+        hosts = coordinator.data or {}
+        previous = self.config_entry.options.get(CONF_AUTO_SECURITY_HOSTS, {})
+        previous = previous if isinstance(previous, dict) else {}
+        if not hosts:
+            return self.async_show_form(
+                step_id="security_maintenance", data_schema=vol.Schema({}),
+                errors={"base": "no_hosts"},
+            )
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                selected = validate_maintenance_groups(
+                    user_input, known_host_ids=set(hosts)
+                )
+            except ValueError as err:
+                reason = str(err).lower()
+                errors["base"] = (
+                    "duplicate_hosts" if "duplicate" in reason else
+                    "missing_hosts" if "missing" in reason else
+                    "too_many_hosts" if "maximum 30" in reason else
+                    "invalid_hosts"
+                )
+            else:
+                # The multiselect is not a reorderable list. Within a stage,
+                # execute in predictable friendly-name order, never raw UUID order.
+                def friendly_name(host_id: str) -> tuple[str, str]:
+                    host = hosts[host_id]
+                    name = host.get("friendly_name") or host.get("hostname") or host_id
+                    return (str(name).casefold(), host_id)
+
+                for stage in MAINTENANCE_STAGES:
+                    selected[stage].sort(key=friendly_name)
+                return self.async_create_entry(
+                    title="",
+                    data={**self.config_entry.options, CONF_AUTO_SECURITY_HOSTS: selected},
+                )
+
+        choices = [
+            SelectOptionDict(
+                value=host_id,
+                label=f"{host.get('friendly_name') or host.get('hostname') or host_id} ({host_id})",
+            )
+            for host_id, host in sorted(
+                hosts.items(),
+                key=lambda pair: str(
+                    pair[1].get("friendly_name") or pair[1].get("hostname") or pair[0]
+                ).casefold(),
+            )
+        ]
+        picker = SelectSelector(
+            SelectSelectorConfig(
+                options=choices, mode=SelectSelectorMode.DROPDOWN, multiple=True,
+            )
+        )
+        schema = vol.Schema({
+            vol.Required(
+                stage, default=[host_id for host_id in previous.get(stage, [])
+                                if host_id in hosts]
+            ): picker
+            for stage in MAINTENANCE_STAGES
+        })
+        return self.async_show_form(
+            step_id="security_maintenance", data_schema=schema, errors=errors,
+        )
 
     async def async_step_tracked_packages(
         self, user_input: dict[str, Any] | None = None

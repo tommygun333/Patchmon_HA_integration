@@ -133,3 +133,10 @@ node --check custom_components/patchmon/www/patchmon-security-report-card.js
 ```
 
 For missing `patchmon.get_security_reports`, check the integration reload and HA logs. If the JavaScript card doesn't render, check browser cache and the resource URL in Dashboard Resources. For an offline or stale host, check its last PatchMon inventory report. For blocked installations inspect the detailed report's backup preflight failures, validation status and post-health status. **The next report after an update should show original selected versions in its before snapshot and current versions in verification/after snapshot.**
+
+
+## Automatic host selection (v0.2.5)
+
+In PatchMon integration options, open **Automatic security updates** and select hosts by name in the stages **Proxmox**, **standard**, **critical**, and **PBS**. Hosts run in stage order, alphabetically by name within a stage. Each host must be selected at most once, and newly discovered hosts are not enrolled automatically.
+
+The `patchmon.security_maintenance` action can now omit `host_ids` to use the saved list; manual calls with explicit `host_ids` still override it. Missing selections or inventory hosts block the call before any installation. For your 03:10 VZDump/PBS backups and PBS verification around 03:43, the example starts at **03:50 Sunday**, waits up to 20 minutes, then always executes the PatchMon preflight. If prerequisites remain unsatisfied, no packages are installed and a blocked cycle report is written. The backup-status templates must be tested and refreshed in HA before enabling the automation.

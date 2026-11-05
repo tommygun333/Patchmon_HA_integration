@@ -49,7 +49,8 @@
         "title": "PatchMon options",
         "menu_options": {
           "general": "General settings",
-          "tracked_packages": "Watched packages by host"
+          "tracked_packages": "Watched packages by host",
+          "security_maintenance": "Automatic security updates"
         }
       },
       "general": {
@@ -78,10 +79,30 @@
         "data": {
           "package_names": "Package names"
         }
+      },
+      "security_maintenance": {
+        "title": "Automatic security updates — opt-in host selection",
+        "description": "Select only Linux hosts approved for unattended security updates. Order: Proxmox → standard → critical → PBS. Within each group, hosts are processed alphabetically by name. New PatchMon hosts are never selected automatically. The saved list is used when the security_maintenance action omits host_ids.",
+        "data": {
+          "proxmox": "1. Proxmox host(s) — first",
+          "standard": "2. Standard/noncritical hosts",
+          "critical": "3. Critical hosts",
+          "pbs": "4. Proxmox Backup Server — last"
+        },
+        "data_description": {
+          "proxmox": "Select host(s) that must be updated first.",
+          "standard": "Select LXCs/VMs with lower service impact.",
+          "critical": "Select critical services only after health checks are configured.",
+          "pbs": "Select the PBS operating system host (not its PVE VMID) last."
+        }
       }
     },
     "error": {
-      "no_hosts": "No host inventory available; refresh the integration first."
+      "no_hosts": "No host inventory available; refresh the integration first.",
+      "duplicate_hosts": "A host can appear in only one update stage.",
+      "missing_hosts": "One or more selected hosts are no longer in the PatchMon inventory.",
+      "too_many_hosts": "Select no more than 30 hosts in total.",
+      "invalid_hosts": "Invalid host selection."
     }
   }
 }
