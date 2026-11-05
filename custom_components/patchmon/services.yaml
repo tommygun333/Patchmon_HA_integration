@@ -109,9 +109,21 @@ security_maintenance:
           mode: box
     notify:
       name: Persistent notification report
+      description: Automatic-source runs always alert; manual-source runs honor this option.
       default: true
       selector:
         boolean:
+    report_source:
+      name: Report source
+      description: Keep the default for scheduled automatic maintenance; use Manual for ad-hoc runs.
+      default: automation
+      selector:
+        select:
+          options:
+            - label: Automation
+              value: automation
+            - label: Manual
+              value: manual
 
     require_backup_checks:
       name: Require completed backups before installation
@@ -185,7 +197,7 @@ validate_patch_all:
 
 get_security_reports:
   name: Get saved security maintenance reports
-  description: List recent completed cycles, or pass report_id for the full report.
+  description: List recent completed reports, or pass report_id for the full report.
   fields:
     config_entry_id:
       name: PatchMon server
@@ -200,6 +212,15 @@ get_security_reports:
       name: Filter reports by host ID
       selector:
         text:
+    report_source:
+      name: Filter by report source
+      selector:
+        select:
+          options:
+            - label: Automation
+              value: automation
+            - label: Manual
+              value: manual
     limit:
       name: Number of reports
       default: 26
@@ -220,6 +241,20 @@ acknowledge_security_report:
           integration: patchmon
     report_id:
       name: Latest report ID (optional)
+      selector:
+        text:
+
+acknowledge_automation_security_report:
+  name: Acknowledge latest automatic security maintenance report
+  description: Clears only the automatic-maintenance unread indicator; retains all reports.
+  fields:
+    config_entry_id:
+      name: PatchMon server
+      selector:
+        config_entry:
+          integration: patchmon
+    report_id:
+      name: Latest automatic report ID (optional)
       selector:
         text:
 

@@ -23,6 +23,7 @@
       continue_on_timeout: true
     - action: patchmon.security_maintenance
       data:
+        report_source: automation
         # host_ids intentionally omitted: uses the selected hosts from
         # the integration's Automatic security updates options screen.
         # Set config_entry_id here only if multiple PatchMon servers configured.

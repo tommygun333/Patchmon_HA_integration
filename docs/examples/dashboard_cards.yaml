@@ -14,7 +14,7 @@
 - type: custom:patchmon-security-report-card
   mode: attention
   title: Weekly security maintenance
-  hide_when_read: true
+  report_source: automation
   # config_entry_id: "<PATCHMON_HA_CONFIG_ENTRY_ID>"   # if multiple PatchMon servers
   # unread_entity: binary_sensor.<actual_patchmon_entity_id>
 
@@ -29,7 +29,7 @@
     type: custom:patchmon-security-report-card
     mode: attention
     title: Security updates finished
-    hide_when_read: false
+    report_source: automation
 
 # 4. Add the full report viewer to a dedicated Security page/dashboard:
 - type: custom:patchmon-security-report-card
@@ -44,10 +44,18 @@
   host_id: "<PATCHMON_PROXMOX_HOST_UUID>"
   limit: 26
 
-# 6. Optional built-in Entity card alongside the custom cards:
+# 6. Compact per-host launcher; opens a responsive native Home Assistant dialog.
+- type: custom:patchmon-security-report-card
+  mode: host
+  display: dialog
+  title: Proxmox update reports
+  host_id: "<PATCHMON_PROXMOX_HOST_UUID>"
+  limit: 26
+
+# 7. Optional built-in Entity card alongside the custom cards:
 # type: entities
 # title: PatchMon attention
 # entities:
-#   - entity: binary_sensor.<actual_security_report_unread_entity>
+#   - entity: binary_sensor.<actual_automation_security_report_unread_entity>
 #   - entity: sensor.<actual_patchmon_server_last_security_maintenance_entity>
 #   - entity: sensor.<actual_proxmox_last_security_maintenance_entity>

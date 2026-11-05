@@ -30,7 +30,7 @@ For each specified host, the integration selects only packages for which PatchMo
 type: custom:patchmon-security-report-card
 mode: attention
 title: Weekly security maintenance
-hide_when_read: true
+report_source: automation
 ```
 
 ```yaml
@@ -49,13 +49,22 @@ host_id: "04ed663f-7b47-434e-9408-76b48a45fc22"
 title: Lab security update history
 ```
 
-The unread binary sensor can also be placed in your own conditional attention card. The new cards do not depend on entity-name guesses; if you build your own UI, look up the generated entity IDs in **Developer Tools → States**. See [dashboard_cards.yaml](examples/dashboard_cards.yaml) for additional ready-to-copy layouts.
+```yaml
+# Compact per-host launcher using Home Assistant's native dialog manager
+type: custom:patchmon-security-report-card
+mode: host
+display: dialog
+host_id: "04ed663f-7b47-434e-9408-76b48a45fc22"
+title: Lab update reports
+```
+
+Use Home Assistant's built-in card visibility with the **Automatic security maintenance report unread** binary sensor when the attention card should disappear after acknowledgment. The legacy `hide_when_read` option remains accepted but no longer hides the card internally. The cards do not depend on entity-name guesses; look up generated entity IDs in **Developer Tools → States**. See [dashboard_cards.yaml](examples/dashboard_cards.yaml) for additional ready-to-copy layouts.
 
 ## Stored reports and entities
 
-By default the integration retains the most recent **26 completed installation cycles**, newest first. Each cycle gets a `report_id`, start/end timestamps, mode, status, summary counts, and host entries. Host entries can include validation and installation IDs, before/after installed versions, dependency/removal details, pre/post health, package errors, remaining selected packages, and reboot requirements. History persists in Home Assistant `.storage` across restarts. Previous unpersisted test action responses are not imported retroactively.
+The integration retains up to **26 automatic reports and 26 manual validation reports** per config entry, newest first. Every report has a `report_id`, `report_source: automation | manual`, type/mode, start/end timestamps, status, summary counts, and host entries using actual PatchMon UUIDs. Host entries can include validation and installation IDs, before/after versions, dependency/removal details, bounded validation console output, health results, errors, remaining packages, and reboot requirements. History persists in Home Assistant `.storage` across restarts. Previous unpersisted test responses are not imported retroactively.
 
-New diagnostic entities include a fleet-level **Last security maintenance** sensor, a **Security maintenance report unread** binary sensor, and a **Last security maintenance** sensor for each PatchMon host. These deliberately carry only compact summary attributes; full reports are fetched on demand, keeping Recorder lean. Acknowledging a report marks it read but does not remove the saved history. Interrupted cycles are kept separately for reconciliation instead of being silently marked complete.
+Diagnostic entities include a fleet-level **Last security maintenance** sensor, the existing general unread sensor, a separate stable **Automatic security maintenance report unread** binary sensor, and a **Last security maintenance** sensor per host. These carry only compact attributes; full reports are fetched on demand. `patchmon.acknowledge_automation_security_report` clears only automatic attention, while the existing acknowledgment remains available for mixed history. Interrupted cycles remain separate for reconciliation.
 
 Actions available under **Developer Tools → Actions**:
 
@@ -80,13 +89,20 @@ Actions available under **Developer Tools → Actions**:
 # action: patchmon.acknowledge_security_report
 # data:
 #   report_id: "PASTE_REPORT_ID_HERE"
+
+# Acknowledge only the latest automatic report:
+# action: patchmon.acknowledge_automation_security_report
+# data:
+#   report_id: "PASTE_AUTOMATION_REPORT_ID_HERE"
 ```
+
+Every completed automatic-source run creates its own persistent alert, including zero-update, blocked, failed, and recovered outcomes. Its **View report** link opens the exact report at `/patchmon-reports/<config_entry_id>/<report_id>`; the hidden panel has no sidebar entry.
 
 Actions `patchmon.reconcile_security_reports` and `patchmon.resolve_interrupted_security_cycle` support post-restart investigation. Reconciliation reads existing PatchMon run IDs; it must never automatically approve a previously interrupted validation. Only resolve an interrupted cycle after confirming no patch jobs remain active.
 
 ## Manual validation before full updates
 
-The per-host **Validate pending updates** button submits the currently pending named package list as a PatchMon dry-run, and publishes status/events. The original **Patch all packages** button remains available and unchanged. Linux PatchMon does not currently support a *native patch-all dry-run*, so the preflight is not an exact simulation of a full upgrade. A passed preflight is useful information, **not** a guarantee that full patch-all will have an identical transaction. No PatchMon upstream fork is required.
+The per-host **Validate pending updates** button submits the currently pending named package list as a PatchMon dry-run and persists a `report_source: manual` report for successful, empty, blocked, and failed results. Console evidence is bounded to 4096 characters/40 lines. The original **Patch all packages** button remains available and unchanged. Linux PatchMon does not support a *native patch-all dry-run*, so this is not an exact full-upgrade simulation. The validation action never approves or installs packages.
 
 ## Scheduled weekly 03:30 example
 
@@ -97,6 +113,7 @@ Example action data after substituting your own entities:
 ```yaml
 action: patchmon.security_maintenance
 data:
+  report_source: automation
   host_ids:
     - "PROXMOX_PATCHMON_UUID"
     - "NONCRITICAL_LXC_PATCHMON_UUID"

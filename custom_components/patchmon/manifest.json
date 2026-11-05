@@ -6,12 +6,13 @@
   ],
   "config_flow": true,
   "dependencies": [
-    "http"
+    "http",
+    "panel_custom"
   ],
   "documentation": "https://github.com/tommygun333/Patchmon_HA_integration",
   "integration_type": "hub",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/tommygun333/Patchmon_HA_integration/issues",
   "requirements": [],
-  "version": "0.2.5"
+  "version": "0.3.0"
 }

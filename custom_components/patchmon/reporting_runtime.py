@@ -5,16 +5,21 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Callable
+from urllib.parse import quote
 
 import voluptuous as vol
 from homeassistant.components import persistent_notification
 from homeassistant.core import SupportsResponse
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.storage import Store
 
 from .maintenance_history import MaintenanceHistory, utc_now
-from .maintenance_workflow import run_security_maintenance, verify_post_patch
+from .maintenance_workflow import (
+    run_security_maintenance,
+    validate_pending_updates,
+    verify_post_patch,
+)
 
 _LOGGER = logging.getLogger(__name__)
 EVENT_REPORT = "patchmon_security_maintenance_report"
@@ -24,6 +29,7 @@ REPORTS_SCHEMA = vol.Schema({
     vol.Optional("config_entry_id"): cv.string,
     vol.Optional("report_id"): cv.string,
     vol.Optional("host_id"): cv.string,
+    vol.Optional("report_source"): vol.In(("automation", "manual")),
     vol.Optional("limit", default=26): vol.All(vol.Coerce(int), vol.Range(min=1, max=26)),
 })
 ACK_SCHEMA = vol.Schema({
@@ -154,8 +160,11 @@ async def setup_reporting(hass: Any, coordinator: Any) -> MaintenanceHistory:
                     if result and not history.active:
                         hass.bus.async_fire(EVENT_REPORT, {
                             "report_id": result.get("report_id"), "status": result.get("status"),
+                            "report_source": result.get("report_source", "automation"),
                             "recovered": True, "summary": result.get("summary", {}),
                         })
+                        if result.get("report_source") == "automation":
+                            _notify(hass, result)
                         return
                 except Exception:
                     _LOGGER.exception("Cannot reconcile interrupted PatchMon security cycle")
@@ -167,6 +176,8 @@ async def setup_reporting(hass: Any, coordinator: Any) -> MaintenanceHistory:
 def _summary_event(report: dict[str, Any]) -> dict[str, Any]:
     return {
         "report_id": report.get("report_id"), "started_at": report.get("started_at"),
+        "report_source": report.get("report_source", "automation"),
+        "report_type": report.get("report_type", "security_maintenance"),
         "completed_at": report.get("completed_at"), "mode": report.get("mode"),
         "status": report.get("status"), "summary": report.get("summary", {}),
         "hosts": [{"host_id": h.get("host_id"), "state": h.get("state"),
@@ -176,10 +187,19 @@ def _summary_event(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def report_url(report: dict[str, Any]) -> str:
+    """Stable hidden-panel route for one exact config entry and report ID."""
+    entry_id = quote(str(report.get("config_entry_id") or ""), safe="")
+    report_id = quote(str(report.get("report_id") or ""), safe="")
+    return f"/patchmon-reports/{entry_id}/{report_id}"
+
+
 def _notify(hass: Any, report: dict[str, Any]) -> None:
     s = report.get("summary", {})
+    manual_validation = report.get("report_type") == "patch_all_validation"
     lines = [
-        f"**PatchMon security maintenance — {report.get('mode')}**",
+        ("**PatchMon manual update validation**" if manual_validation else
+         f"**PatchMon security maintenance — {report.get('mode')}**"),
         f"Status: **{report.get('status')}** | Date: {report.get('completed_at')}",
         f"Hosts: {s.get('hosts', 0)} | Verified: {s.get('verified', 0)} | "
         f"Failed: {s.get('failed', 0)} | Reboot required: {s.get('reboot_required', 0)}",
@@ -187,10 +207,14 @@ def _notify(hass: Any, report: dict[str, Any]) -> None:
     for h in report.get("hosts", []):
         lines.append(f"- {h.get('hostname') or h.get('host_id')}: {h.get('state')} "
                      f"({h.get('security_count', 0)} security updates)")
-    lines.append("The full dated report is available in the PatchMon Security Reports dashboard card.")
+    lines.append(f"[View report]({report_url(report)})")
+    entry_id = str(report.get("config_entry_id") or "unknown")
+    report_id = str(report.get("report_id") or "unknown")
     persistent_notification.async_create(
-        hass, "\n".join(lines), title="PatchMon security maintenance",
-        notification_id="patchmon_security_maintenance",
+        hass, "\n".join(lines),
+        title=("PatchMon manual update validation" if manual_validation
+               else "PatchMon security maintenance"),
+        notification_id=f"patchmon_report_{entry_id}_{report_id}",
     )
 
 
@@ -198,6 +222,7 @@ async def run_reporting_maintenance(hass: Any, coordinator: Any,
                                     data: dict[str, Any]) -> dict[str, Any]:
     """HA orchestration around upstream patch-run lifecycle + persistent report."""
     mode = data.get("mode") or ("validate" if data.get("validate", True) else "plan")
+    report_source = data.get("report_source", "automation")
     history: MaintenanceHistory = coordinator.maintenance_reports
     if mode == "install" and history.active:
         raise ServiceValidationError(
@@ -208,7 +233,9 @@ async def run_reporting_maintenance(hass: Any, coordinator: Any,
         preflight = backup_preflight(hass, data)
         if data.get("require_backup_checks") and preflight["status"] != "passed":
             report = {
-                "report_id": history.new_id(), "mode": mode, "status": "blocked",
+                "report_id": history.new_id(), "report_source": report_source,
+                "report_type": "security_maintenance",
+                "mode": mode, "status": "blocked",
                 "started_at": utc_now(), "completed_at": utc_now(),
                 "preflight": preflight,
                 "hosts": [{"host_id": id_, "state": "not_started", "reason": "Backup gate blocked"}
@@ -221,11 +248,11 @@ async def run_reporting_maintenance(hass: Any, coordinator: Any,
             report["config_entry_id"] = coordinator.entry.entry_id
             await history.finish(report)
             hass.bus.async_fire(EVENT_REPORT, _summary_event(report))
-            if data.get("notify", True):
+            if report_source == "automation" or data.get("notify", True):
                 _notify(hass, report)
             return report
 
-    report_id = history.new_id() if mode == "install" else None
+    report_id = history.new_id()
     started = False
 
     async def checkpoint(report: dict[str, Any]) -> None:
@@ -233,6 +260,8 @@ async def run_reporting_maintenance(hass: Any, coordinator: Any,
         # Retain backup evidence and config ID in *each* crash-safe checkpoint.
         report.setdefault("preflight", preflight)
         report.setdefault("config_entry_id", coordinator.entry.entry_id)
+        report.setdefault("report_source", report_source)
+        report.setdefault("report_type", "security_maintenance")
         if not started:
             await history.start(report)
             started = True
@@ -275,13 +304,92 @@ async def run_reporting_maintenance(hass: Any, coordinator: Any,
         raise
 
     report["config_entry_id"] = coordinator.entry.entry_id
+    report["report_source"] = report_source
+    report["report_type"] = "security_maintenance"
     if mode == "install":
         report["preflight"] = preflight
-        await history.finish(report)
+    await history.finish(report)
+    hass.bus.async_fire(EVENT_REPORT, _summary_event(report))
+    if report_source == "automation" or data.get("notify", True):
+        _notify(hass, report)
+    return report
+
+
+async def run_reporting_validation(
+    hass: Any, coordinator: Any, data: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist one manual selected-package validation without approving installs."""
+    started_at = utc_now()
+    host_id = data["host_id"]
+    try:
+        result = await validate_pending_updates(
+            coordinator.client, host_id,
+            max_report_age_minutes=data.get("max_report_age_minutes", 120),
+        )
+    except Exception as exc:
+        _LOGGER.exception("PatchMon manual validation failed")
+        result = {
+            "host_id": host_id,
+            "hostname": host_id,
+            "status": "failed",
+            "success": False,
+            "selected_count": 0,
+            "primary_packages": [],
+            "reason": str(exc)[:500],
+        }
+
+    status = str(result.get("status") or "failed")
+    success = bool(result.get("success")) or status == "no_updates"
+    validation = dict(result.get("validation") or {})
+    if result.get("reason") and not validation.get("reason"):
+        validation["reason"] = str(result["reason"])[:500]
+    host_report = {
+        "host_id": host_id,
+        "hostname": result.get("hostname") or host_id,
+        "state": status,
+        "security_count": result.get("selected_count", 0),
+        "selected_count": result.get("selected_count", 0),
+        "security_packages": result.get("package_details") or [
+            {"name": name} for name in result.get("primary_packages", [])
+        ],
+        "validation": validation,
+        "error": "" if success else str(
+            result.get("reason") or validation.get("reason") or ""
+        )[:500],
+    }
+    report = {
+        "report_id": coordinator.maintenance_reports.new_id(),
+        "config_entry_id": coordinator.entry.entry_id,
+        "report_source": "manual",
+        "report_type": "patch_all_validation",
+        "mode": "validate_patch_all",
+        "status": "completed" if success else "needs_attention",
+        "started_at": started_at,
+        "completed_at": utc_now(),
+        "hosts": [host_report],
+        "summary": {
+            "hosts": 1,
+            "verified": 0,
+            "validated": 1 if result.get("success") else 0,
+            "planned": 0,
+            "no_security_updates": 1 if status == "no_updates" else 0,
+            "blocked": 1 if status == "blocked" else 0,
+            "failed": 0 if success else 1,
+            "not_started": 0,
+            "reboot_required": 0,
+        },
+        "note": result.get("note"),
+    }
+    await coordinator.maintenance_reports.finish(report)
     hass.bus.async_fire(EVENT_REPORT, _summary_event(report))
     if data.get("notify", True):
         _notify(hass, report)
-    return report
+    return {
+        **result,
+        "report_id": report["report_id"],
+        "report_source": "manual",
+        "report_url": report_url(report),
+    }
 
 
 def register_report_services(hass: Any, resolve: Callable[[Any, Any], Any]) -> None:
@@ -292,10 +400,15 @@ def register_report_services(hass: Any, resolve: Callable[[Any, Any], Any]) -> N
             report = history.get(rid)
             if report is None:
                 raise ServiceValidationError("No saved security report with that ID")
-            return {"report": report, "unread": history.unread}
+            return {"report": report, "unread": history.unread,
+                    "automation_unread": history.automation_unread}
         return {"reports": history.list(limit=call.data["limit"],
-                                         host_id=call.data.get("host_id")),
-                "unread": history.unread, "retained": history.limit,
+                                         host_id=call.data.get("host_id"),
+                                         report_source=call.data.get("report_source")),
+                "unread": history.unread,
+                "automation_unread": history.automation_unread,
+                "retained": history.limit,
+                "retained_per_source": history.limit,
                 "active": (history.active and {
                     "report_id": history.active.get("report_id"),
                     "status": history.active.get("status"),
@@ -308,6 +421,15 @@ def register_report_services(hass: Any, resolve: Callable[[Any, Any], Any]) -> N
         except ValueError as exc:
             raise ServiceValidationError(str(exc)) from exc
         return {"acknowledged_report_id": rid, "unread": history.unread}
+
+    async def acknowledge_automation(call: Any) -> dict[str, Any]:
+        history = resolve(hass, call).maintenance_reports
+        try:
+            rid = await history.acknowledge_automation(call.data.get("report_id"))
+        except ValueError as exc:
+            raise ServiceValidationError(str(exc)) from exc
+        return {"acknowledged_report_id": rid,
+                "automation_unread": history.automation_unread}
 
     async def reconcile(call: Any) -> dict[str, Any]:
         coordinator = resolve(hass, call)
@@ -347,6 +469,7 @@ def register_report_services(hass: Any, resolve: Callable[[Any, Any], Any]) -> N
     for name, fn, schema in (
         ("get_security_reports", get_reports, REPORTS_SCHEMA),
         ("acknowledge_security_report", acknowledge, ACK_SCHEMA),
+        ("acknowledge_automation_security_report", acknowledge_automation, ACK_SCHEMA),
         ("reconcile_security_reports", reconcile, RECONCILE_SCHEMA),
         ("resolve_interrupted_security_cycle", resolve_interrupted, RESOLVE_SCHEMA),
     ):

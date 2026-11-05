@@ -301,35 +301,49 @@ async def validate_pending_updates(
     hosts = await client.async_get_hosts()
     host = next((h for h in hosts if str(h.get("id")) == host_id), None)
     if host is None:
-        return {"status": "blocked", "reason": "Host not in PatchMon inventory", "host_id": host_id}
+        return {"status": "blocked", "reason": "Host not in PatchMon inventory",
+                "host_id": host_id, "hostname": host_id}
+    hostname = host.get("hostname") or host_id
     last = _report_time(host.get("last_update"))
     if (last is None or last > datetime.now(timezone.utc) + timedelta(minutes=5)
             or datetime.now(timezone.utc) - last > timedelta(minutes=max_report_age_minutes)):
-        return {"status": "blocked", "reason": "Host inventory stale or invalid", "host_id": host_id}
+        return {"status": "blocked", "reason": "Host inventory stale or invalid",
+                "host_id": host_id, "hostname": hostname}
     if host.get("effective_status") in ("inactive", "offline"):
-        return {"status": "blocked", "reason": "Host offline", "host_id": host_id}
+        return {"status": "blocked", "reason": "Host offline", "host_id": host_id,
+                "hostname": hostname}
     packages = await client.async_get_updates(host_id)
     names = [p.get("name") for p in packages if p.get("needs_update", True)]
     if not names:
-        return {"status": "no_updates", "host_id": host_id, "selected_count": 0}
+        return {"status": "no_updates", "host_id": host_id, "hostname": hostname,
+                "selected_count": 0, "primary_packages": []}
     if (len(names) > MAX_PACKAGES_PER_VALIDATION
             or len(set(names)) != len(names)
             or any(not isinstance(name, str) or not PACKAGE_NAME.fullmatch(name) for name in names)):
         return {"status": "blocked", "host_id": host_id,
+                "hostname": hostname,
                 "reason": "Invalid, duplicate, or more than 100 pending package names"}
+    package_details = [{
+        "name": package.get("name"),
+        "installed_version": package.get("current_version"),
+        "available_version": package.get("available_version"),
+    } for package in packages if package.get("name") in names]
+    package_details.sort(key=lambda package: str(package.get("name") or ""))
     plan = {
         "state": "ready", "host_id": host_id,
-        "security_packages": [{"name": name} for name in sorted(names)],
+        "security_packages": package_details,
     }
     validation = await validate_security_plan(
         client, plan, timeout_seconds=validation_timeout_seconds,
     )
     return {
         "host_id": host_id,
+        "hostname": hostname,
         "status": validation["status"],
         "success": validation.get("success", False),
         "selected_count": len(names),
         "primary_packages": sorted(names),
+        "package_details": package_details,
         "validation": validation,
         "full_patch_all_simulation": False,
         "note": "Selected-package preflight; a normal Patch all uses a different APT upgrade transaction",

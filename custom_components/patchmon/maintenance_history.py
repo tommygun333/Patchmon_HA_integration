@@ -12,6 +12,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 RETAIN_CYCLES = 26
+REPORT_SOURCES = frozenset({"automation", "manual"})
 TERMINAL_HOSTS = frozenset({
     "verified", "no_security_updates", "blocked", "validation_failed",
     "installation_failed", "failed", "needs_attention", "unverified",
@@ -30,6 +31,8 @@ def cycle_summary(report: dict[str, Any]) -> dict[str, Any]:
     hosts = report.get("hosts", [])
     return {
         "report_id": report.get("report_id"),
+        "report_source": report.get("report_source", "automation"),
+        "report_type": report.get("report_type", "security_maintenance"),
         "started_at": report.get("started_at"),
         "completed_at": report.get("completed_at"),
         "mode": report.get("mode"),
@@ -57,17 +60,59 @@ class MaintenanceHistory:
         self._reports: list[dict[str, Any]] = []
         self._active: dict[str, Any] | None = None
         self._acknowledged: str | None = None
+        self._automation_acknowledged: str | None = None
         self._listeners: list[Callable[[], None]] = []
 
     async def load(self) -> None:
         data = await self._store.async_load() or {}
-        self._reports = sorted(
-            (r for r in data.get("reports", []) if isinstance(r, dict)),
+        raw_reports = [r for r in data.get("reports", []) if isinstance(r, dict)]
+        self._reports = self._prune(sorted(
+            (self._normalise_report(r) for r in raw_reports),
             key=lambda r: str(r.get("started_at") or ""), reverse=True,
-        )[:self.limit]
-        self._active = data.get("active")
+        ))
+        active = data.get("active")
+        self._active = self._normalise_report(active) if isinstance(active, dict) else None
         self._acknowledged = data.get("acknowledged")
-        self._emit()
+        self._automation_acknowledged = data.get("automation_acknowledged")
+        if self._automation_acknowledged is None and self._acknowledged:
+            acknowledged = next(
+                (r for r in self._reports if r.get("report_id") == self._acknowledged), None
+            )
+            if acknowledged and acknowledged.get("report_source") == "automation":
+                self._automation_acknowledged = self._acknowledged
+        migrated = (
+            any(r.get("report_source") not in REPORT_SOURCES for r in raw_reports)
+            or any("report_source" not in r for r in raw_reports)
+            or (isinstance(active, dict) and "report_source" not in active)
+            or "automation_acknowledged" not in data
+        )
+        if migrated:
+            await self._persist()
+        else:
+            self._emit()
+
+    @staticmethod
+    def _normalise_report(report: dict[str, Any]) -> dict[str, Any]:
+        """Migrate old install-cycle records without losing their IDs or details."""
+        result = copy.deepcopy(report)
+        if result.get("report_source") not in REPORT_SOURCES:
+            # Before report origins existed, only security-maintenance cycles
+            # were persisted. Treat those as automation history.
+            result["report_source"] = "automation"
+        result.setdefault("report_type", "security_maintenance")
+        return result
+
+    def _prune(self, reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Retain a bounded history independently for automation and manual runs."""
+        counts = {source: 0 for source in REPORT_SOURCES}
+        retained: list[dict[str, Any]] = []
+        for report in reports:
+            source = report.get("report_source", "automation")
+            if counts[source] >= self.limit:
+                continue
+            counts[source] += 1
+            retained.append(report)
+        return retained
 
     def subscribe(self, cb: Callable[[], None]) -> Callable[[], None]:
         self._listeners.append(cb)
@@ -84,6 +129,7 @@ class MaintenanceHistory:
         await self._store.async_save({
             "reports": self._reports, "active": self._active,
             "acknowledged": self._acknowledged,
+            "automation_acknowledged": self._automation_acknowledged,
         })
         self._emit()
 
@@ -99,19 +145,36 @@ class MaintenanceHistory:
         latest = self.latest()
         return bool(latest and latest.get("report_id") != self._acknowledged)
 
-    def latest(self) -> dict[str, Any] | None:
-        return copy.deepcopy(self._reports[0]) if self._reports else None
+    @property
+    def automation_unread(self) -> bool:
+        latest = self.latest(report_source="automation")
+        return bool(
+            latest and latest.get("report_id") != self._automation_acknowledged
+        )
 
-    def latest_host(self, host_id: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    def latest(self, *, report_source: str | None = None) -> dict[str, Any] | None:
         for report in self._reports:
+            if report_source is None or report.get("report_source") == report_source:
+                return copy.deepcopy(report)
+        return None
+
+    def latest_host(
+        self, host_id: str, *, report_source: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        for report in self._reports:
+            if report_source and report.get("report_source") != report_source:
+                continue
             for host in report.get("hosts", []):
                 if host.get("host_id") == host_id:
                     return copy.deepcopy(report), copy.deepcopy(host)
         return None
 
     def list(self, *, limit: int = RETAIN_CYCLES, host_id: str | None = None,
+             report_source: str | None = None,
              detailed: bool = False) -> list[dict[str, Any]]:
         reports = self._reports
+        if report_source:
+            reports = [r for r in reports if r.get("report_source") == report_source]
         if host_id:
             reports = [r for r in reports if any(
                 h.get("host_id") == host_id for h in r.get("hosts", []))]
@@ -131,13 +194,13 @@ class MaintenanceHistory:
             raise ValueError("A persisted maintenance cycle is not resolved; reconcile it first")
         if not report.get("report_id"):
             raise ValueError("Maintenance cycle requires a report_id")
-        self._active = copy.deepcopy(report)
+        self._active = self._normalise_report(report)
         await self._persist()
 
     async def checkpoint(self, report: dict[str, Any]) -> None:
         if not self._active or self._active.get("report_id") != report.get("report_id"):
             raise ValueError("Maintenance checkpoint does not match the active cycle")
-        self._active = copy.deepcopy(report)
+        self._active = self._normalise_report(report)
         await self._persist()
 
     async def finish(self, report: dict[str, Any]) -> None:
@@ -146,10 +209,11 @@ class MaintenanceHistory:
         if not report.get("completed_at"):
             report = {**report, "completed_at": utc_now()}
         rid = report.get("report_id")
+        report = self._normalise_report(report)
         self._reports = [copy.deepcopy(report)] + [
             item for item in self._reports if item.get("report_id") != rid
         ]
-        self._reports = self._reports[:self.limit]
+        self._reports = self._prune(self._reports)
         self._active = None
         await self._persist()
 
@@ -162,6 +226,17 @@ class MaintenanceHistory:
         self._acknowledged = latest["report_id"]
         await self._persist()
         return self._acknowledged
+
+    async def acknowledge_automation(self, report_id: str | None = None) -> str | None:
+        """Acknowledge only the latest automation report."""
+        latest = self.latest(report_source="automation")
+        if not latest:
+            return None
+        if report_id is not None and report_id != latest.get("report_id"):
+            raise ValueError("Only the latest automation report can be acknowledged")
+        self._automation_acknowledged = latest["report_id"]
+        await self._persist()
+        return self._automation_acknowledged
 
     async def reconcile(self, client: Any, verify: Callable[..., Any]) -> dict[str, Any] | None:
         """Observe interrupted runs without triggering or approving new patch jobs.

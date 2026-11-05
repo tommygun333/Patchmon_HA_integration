@@ -9,7 +9,10 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .coordinator import PatchMonCoordinator
 from .entity import PatchMonHostEntity
-from .maintenance_entities import PatchMonSecurityReportUnread
+from .maintenance_entities import (
+    PatchMonAutomationReportUnread,
+    PatchMonSecurityReportUnread,
+)
 
 
 async def async_setup_entry(
@@ -19,7 +22,10 @@ async def async_setup_entry(
 ) -> None:
     """Set up PatchMon host binary sensors."""
     coordinator: PatchMonCoordinator = entry.runtime_data
-    async_add_entities([PatchMonSecurityReportUnread(coordinator)])
+    async_add_entities([
+        PatchMonSecurityReportUnread(coordinator),
+        PatchMonAutomationReportUnread(coordinator),
+    ])
     known_hosts: set[str] = set()
 
     @callback

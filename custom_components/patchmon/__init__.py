@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import voluptuous as vol
 
+from homeassistant.components import panel_custom
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_PASSWORD, CONF_URL, CONF_USERNAME, CONF_VERIFY_SSL
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
@@ -15,7 +17,6 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.components import persistent_notification
 
 from .api import PatchMonClient, PatchMonError
 from .const import (
@@ -34,14 +35,14 @@ from .const import (
 )
 from .coordinator import PatchMonCoordinator
 from .maintenance_selection import selected_maintenance_host_ids
-from .maintenance_workflow import run_security_maintenance, validate_pending_updates
-from pathlib import Path
-from homeassistant.components.http import StaticPathConfig
-from .reporting_runtime import (
-    setup_reporting, run_reporting_maintenance, register_report_services,
-    extend_maintenance_schema,
-)
 from .report_websocket import register_websocket
+from .reporting_runtime import (
+    extend_maintenance_schema,
+    register_report_services,
+    run_reporting_maintenance,
+    run_reporting_validation,
+    setup_reporting,
+)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -78,6 +79,9 @@ SECURITY_MAINTENANCE_SCHEMA = vol.Schema(
         vol.Optional("max_report_age_minutes", default=120): vol.All(
             vol.Coerce(int), vol.Range(min=5, max=1440)),
         vol.Optional("notify", default=True): cv.boolean,
+        vol.Optional("report_source", default="automation"): vol.In(
+            ("automation", "manual")
+        ),
     }
 )
 
@@ -161,6 +165,14 @@ async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
             False,
         ),
     ])
+    await panel_custom.async_register_panel(
+        hass=hass,
+        frontend_url_path="patchmon-reports",
+        webcomponent_name="patchmon-security-report-panel",
+        module_url="/patchmon-security-reports/patchmon-security-report-card.js",
+        sidebar_title=None,
+        require_admin=False,
+    )
     return True
 
 
@@ -233,10 +245,7 @@ def _register_services(hass: HomeAssistant) -> None:
         if lock.locked():
             raise ServiceValidationError("PatchMon maintenance already active on this server")
         async with lock:
-            result = await validate_pending_updates(
-                coordinator.client, call.data[ATTR_HOST_ID],
-                max_report_age_minutes=call.data["max_report_age_minutes"],
-            )
+            result = await run_reporting_validation(hass, coordinator, dict(call.data))
             hass.bus.async_fire("patchmon_patch_all_preflight_report", {
                 "host_id": call.data[ATTR_HOST_ID],
                 "status": result["status"],
@@ -244,19 +253,6 @@ def _register_services(hass: HomeAssistant) -> None:
                 "validation_run_id": result.get("validation", {}).get("run_id"),
                 "selected_count": result.get("selected_count", 0),
             })
-            if call.data["notify"]:
-                note = (
-                    f"**Selected-package preflight:** {result['status']}\n"
-                    f"Host: {call.data[ATTR_HOST_ID]}\n"
-                    f"Selected pending packages: {result.get('selected_count', 0)}\n"
-                    f"Validation run: {result.get('validation', {}).get('run_id', 'none')}\n\n"
-                    "This is not a native Patch-all dry-run. The normal Patch all "
-                    "button remains a separate manual action."
-                )
-                persistent_notification.async_create(
-                    hass, note, title="PatchMon manual update preflight",
-                    notification_id=f"patchmon_preflight_{call.data[ATTR_HOST_ID]}",
-                )
             return result
 
     hass.services.async_register(

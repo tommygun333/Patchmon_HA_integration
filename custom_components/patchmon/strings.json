@@ -104,5 +104,12 @@
       "too_many_hosts": "Select no more than 30 hosts in total.",
       "invalid_hosts": "Invalid host selection."
     }
+  },
+  "entity": {
+    "binary_sensor": {
+      "automation_security_report_unread": {
+        "name": "Automatic security maintenance report unread"
+      }
+    }
   }
 }

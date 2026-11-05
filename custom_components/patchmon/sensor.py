@@ -166,7 +166,7 @@ class PatchMonHostNumberSensor(PatchMonHostEntity, SensorEntity):
 
 
 class PatchMonLastReportSensor(PatchMonHostEntity, SensorEntity):
-    _attr_name = "Last report"
+    _attr_name = "Last agent inventory"
     _attr_icon = "mdi:clock-check-outline"
     _attr_device_class = SensorDeviceClass.TIMESTAMP
     _attr_entity_category = EntityCategory.DIAGNOSTIC

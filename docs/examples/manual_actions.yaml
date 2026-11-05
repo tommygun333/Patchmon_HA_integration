@@ -3,6 +3,7 @@
 action: patchmon.security_maintenance
 data:
   mode: plan
+  report_source: manual
   host_ids:
     - "<PATCHMON_HOST_UUID>"
   notify: false
@@ -24,6 +25,10 @@ data:
 
 # 6. Mark the latest cycle as read (separate action):
 # action: patchmon.acknowledge_security_report
+# data: {}
+
+# 6b. Mark only the latest automatic report as read:
+# action: patchmon.acknowledge_automation_security_report
 # data: {}
 
 # 7. Observe/reconcile previously interrupted cycle (separate action):

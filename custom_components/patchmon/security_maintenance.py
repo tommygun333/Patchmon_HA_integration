@@ -20,6 +20,13 @@ VALIDATION_TERMINAL = VALIDATION_OK | frozenset(
 )
 
 
+def _console_tail(output: Any, *, max_chars: int = 4096, max_lines: int = 40) -> str:
+    """Keep useful validation evidence without storing an unbounded agent log."""
+    if not isinstance(output, str) or not output:
+        return ""
+    return "\n".join(output.splitlines()[-max_lines:])[-max_chars:]
+
+
 def _report_time(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -165,6 +172,9 @@ async def validate_security_plan(
                 "run_id": run_id,
                 "extra_dependencies": extras,
                 "removals": removals,
+                "console_output_tail": _console_tail(
+                    run.get("shell_output"), max_chars=4096, max_lines=40,
+                ),
                 "execution_safe": False,
                 "reason": (str(run.get("error_message") or "") or
                            ("Simulation proposes package removals" if removals else ""))[:400],

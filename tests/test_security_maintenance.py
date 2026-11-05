@@ -85,10 +85,11 @@ class SecurityPlanTest(unittest.TestCase):
 
 
 class DummyClient:
-    def __init__(self, statuses, affected=None):
+    def __init__(self, statuses, affected=None, output=None):
         self.statuses = iter(statuses)
         self.calls = []
         self.affected = affected
+        self.output = output
 
     async def async_patch_host(self, host_id, **kwargs):
         self.calls.append((host_id, kwargs))
@@ -96,7 +97,8 @@ class DummyClient:
 
     async def async_get_patch_run(self, run_id):
         status = next(self.statuses)
-        return {"status": status, "packages_affected": self.affected}
+        return {"status": status, "packages_affected": self.affected,
+                "shell_output": self.output}
 
 
 class SecurityValidationTest(unittest.IsolatedAsyncioTestCase):
@@ -128,6 +130,15 @@ class SecurityValidationTest(unittest.IsolatedAsyncioTestCase):
         client = DummyClient(["failed"])
         result = await security.validate_security_plan(client, self.plan)
         self.assertFalse(result["success"])
+
+    async def test_validation_console_is_bounded(self):
+        output = "\n".join(f"line-{index}-" + ("x" * 200) for index in range(100))
+        result = await security.validate_security_plan(
+            DummyClient(["validated"], output=output), self.plan,
+        )
+        self.assertLessEqual(len(result["console_output_tail"]), 4096)
+        self.assertLessEqual(len(result["console_output_tail"].splitlines()), 40)
+        self.assertIn("line-99", result["console_output_tail"])
 
     async def test_invalid_empty_run_id(self):
         class BrokenClient(DummyClient):

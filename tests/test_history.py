@@ -76,6 +76,54 @@ class TestHistory(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await restored.acknowledge('3')
 
+    async def test_sources_have_independent_retention_and_automation_ack(self):
+        store = InMemoryStore()
+        history = History(store, limit=2)
+        await history.load()
+        for index, source in enumerate(
+            ("automation", "manual", "automation", "manual", "automation", "manual"),
+            start=1,
+        ):
+            await history.finish({
+                "report_id": f"r{index}",
+                "report_source": source,
+                "started_at": f"2026-11-0{index}T03:30:00+00:00",
+                "hosts": [{"host_id": "host-a", "state": "validated"}],
+            })
+        self.assertEqual(
+            [report["report_id"] for report in history.list(limit=10)],
+            ["r6", "r5"],
+        )
+        self.assertEqual(
+            [report["report_id"] for report in history.list(
+                limit=10, report_source="manual"
+            )],
+            ["r6", "r4"],
+        )
+        self.assertEqual(
+            [report["report_id"] for report in history.list(
+                limit=10, report_source="automation"
+            )],
+            ["r5", "r3"],
+        )
+        self.assertTrue(history.automation_unread)
+        await history.acknowledge_automation("r5")
+        self.assertFalse(history.automation_unread)
+        self.assertTrue(history.unread)
+        await history.acknowledge("r6")
+        self.assertFalse(history.unread)
+
+    async def test_legacy_reports_migrate_to_automation_source(self):
+        store = InMemoryStore({
+            "reports": [{"report_id": "legacy", "started_at": "2026-11-01T03:30:00+00:00"}],
+            "acknowledged": "legacy",
+        })
+        history = History(store)
+        await history.load()
+        self.assertEqual(history.latest()["report_source"], "automation")
+        self.assertFalse(history.automation_unread)
+        self.assertEqual(store.value["automation_acknowledged"], "legacy")
+
     async def test_known_install_recovery_does_not_approve(self):
         store = InMemoryStore({"active": {
             "report_id": "x", "started_at": "2026-11-04T03:30:00+00:00",

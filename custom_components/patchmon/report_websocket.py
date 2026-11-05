@@ -25,6 +25,7 @@ def _history(hass, msg):
     vol.Optional("config_entry_id"): str,
     vol.Optional("report_id"): str,
     vol.Optional("host_id"): str,
+    vol.Optional("report_source"): vol.In(("automation", "manual")),
     vol.Optional("limit", default=26): vol.All(int, vol.Range(min=1, max=26)),
 })
 @callback
@@ -37,11 +38,19 @@ def ws_reports(hass, connection, msg):
             if report is None:
                 connection.send_error(msg["id"], "not_found", "Security report not found")
                 return
-            connection.send_result(msg["id"], {"report": report, "unread": history.unread})
+            connection.send_result(msg["id"], {
+                "report": report,
+                "unread": history.unread,
+                "automation_unread": history.automation_unread,
+            })
             return
         connection.send_result(msg["id"], {
-            "reports": history.list(limit=msg["limit"], host_id=msg.get("host_id")),
+            "reports": history.list(
+                limit=msg["limit"], host_id=msg.get("host_id"),
+                report_source=msg.get("report_source"),
+            ),
             "unread": history.unread,
+            "automation_unread": history.automation_unread,
             "active": history.active,
             "retained": history.limit,
         })
@@ -65,6 +74,26 @@ async def ws_ack(hass, connection, msg):
         connection.send_error(msg["id"], "invalid_report", str(exc))
 
 
+@websocket_api.websocket_command({
+    vol.Required("type"): "patchmon/automation_security_report_ack",
+    vol.Optional("config_entry_id"): str,
+    vol.Optional("report_id"): str,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_automation_ack(hass, connection, msg):
+    try:
+        history = _history(hass, msg)
+        rid = await history.acknowledge_automation(msg.get("report_id"))
+        connection.send_result(msg["id"], {
+            "acknowledged_report_id": rid,
+            "automation_unread": history.automation_unread,
+        })
+    except ValueError as exc:
+        connection.send_error(msg["id"], "invalid_report", str(exc))
+
+
 def register_websocket(hass):
     websocket_api.async_register_command(hass, ws_reports)
     websocket_api.async_register_command(hass, ws_ack)
+    websocket_api.async_register_command(hass, ws_automation_ack)

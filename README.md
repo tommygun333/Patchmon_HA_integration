@@ -159,8 +159,10 @@ PatchMon's native agent and patch-validation API power both **automatic security
 
 - **Security maintenance** (`patchmon.security_maintenance`) accepts `mode: plan`, `mode: validate`, or `mode: install`. The install mode validates each host's selected security-flagged packages, approves the successful PatchMon validation run, waits for installation, then checks the refreshed host inventory. Newer candidate versions and required dependencies are allowed. Normal packages are not selected as primary targets. Hosts are processed in the specified order; `stop_on_failure` defaults to `true`.
 - **Manual updates** still have **Patch all packages** and **Validate pending updates** buttons. The latter simulates currently pending named packages; it is not an exact Linux `patch_all` simulation because upstream PatchMon does not permit that dry-run type.
-- **Persistent history** retains the latest 26 completed install cycles (not merely the most recent notification), latest per-host report, validation/installation IDs, package/version snapshots, errors, health-check results, and reboot flags. Saved data lives in Home Assistant `.storage`, not long Recorder attributes.
-- **Dashboard card** supports attention (unread note, expands to details), viewer (newest-first fleet history), and host-specific modes. Acknowledging a report hides its unread indicator, **not** its history.
+- **Persistent history** retains up to 26 automatic reports and 26 manual validation reports per PatchMon config entry. Reports include a durable `report_source`, actual host UUIDs, validation/installation IDs, package/version snapshots, bounded validation console output, errors, health-check results, and reboot flags. Saved data lives in Home Assistant `.storage`, not long Recorder attributes.
+- **Separate automatic attention** is exposed by the stable `Automatic security maintenance report unread` binary sensor and `patchmon.acknowledge_automation_security_report`. Manual validations cannot clear or replace that automation acknowledgment.
+- **Dashboard UI** supports attention, viewer, host-specific, and compact host-dialog launchers. It uses Home Assistant's native dialog event and `ha-dialog`, with no Browser Mod or more-info monkey-patching. Acknowledging a report clears its indicator, **not** its history.
+- **Deep links** use `/patchmon-reports/<config_entry_id>/<report_id>`. Every report notification includes a **View report** link to the exact config entry and report.
 - **Safety**: configure real backup-success timestamps and backup-idle checks before enabling weekly installation. Missing/stale backups fail closed when `require_backup_checks: true`. No automatic reboot. Interrupted runs are reconciled using PatchMon IDs and never automatically approved a second time.
 
 ### Home Assistant examples
@@ -172,7 +174,7 @@ Register dashboard JavaScript resource **`/patchmon-security-reports/patchmon-se
 - type: custom:patchmon-security-report-card
   mode: attention
   title: Weekly security maintenance
-  hide_when_read: true
+  report_source: automation
 
 # Full fleet history card (always visible)
 - type: custom:patchmon-security-report-card
@@ -185,7 +187,16 @@ Register dashboard JavaScript resource **`/patchmon-security-reports/patchmon-se
   mode: host
   host_id: "04ed663f-7b47-434e-9408-76b48a45fc22"
   title: Lab security updates
+
+# Compact per-host launcher that opens a native responsive dialog
+- type: custom:patchmon-security-report-card
+  mode: host
+  display: dialog
+  host_id: "04ed663f-7b47-434e-9408-76b48a45fc22"
+  title: Lab update reports
 ```
+
+Use Home Assistant card visibility with the automatic unread binary sensor when the attention card should disappear after acknowledgment. The legacy `hide_when_read` option is accepted for configuration compatibility but no longer hides the card internally.
 
 For Developer Tools → Actions, run a read-only plan first:
 

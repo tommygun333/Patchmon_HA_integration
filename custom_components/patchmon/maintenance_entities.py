@@ -34,22 +34,24 @@ class PatchMonSecurityCycleSensor(_ReportListener, SensorEntity):
 
     @property
     def native_value(self):
-        latest = self.coordinator.maintenance_reports.latest()
+        latest = self.coordinator.maintenance_reports.latest(report_source="automation")
         return latest.get("status", "unknown") if latest else "never"
 
     @property
     def extra_state_attributes(self):
         history = self.coordinator.maintenance_reports
-        latest = history.latest()
+        latest = history.latest(report_source="automation")
         if not latest:
             return {"unread": False, "report_count": 0}
         return {
             "report_id": latest.get("report_id"),
+            "report_source": latest.get("report_source", "automation"),
+            "report_type": latest.get("report_type", "security_maintenance"),
             "started_at": latest.get("started_at"),
             "completed_at": latest.get("completed_at"),
             "mode": latest.get("mode"),
             "unread": history.unread,
-            "report_count": len(history.list()),
+            "report_count": len(history.list(report_source="automation")),
             "summary": latest.get("summary", {}),
         }
 
@@ -75,7 +77,43 @@ class PatchMonSecurityReportUnread(_ReportListener, BinarySensorEntity):
     @property
     def extra_state_attributes(self):
         latest = self.coordinator.maintenance_reports.latest()
-        return {"report_id": latest.get("report_id") if latest else None}
+        return {
+            "report_id": latest.get("report_id") if latest else None,
+            "report_source": latest.get("report_source") if latest else None,
+        }
+
+
+class PatchMonAutomationReportUnread(_ReportListener, BinarySensorEntity):
+    """Stable alert entity for completed automatic maintenance reports only."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "automation_security_report_unread"
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_icon = "mdi:shield-sync-outline"
+
+    def __init__(self, coordinator):
+        self.coordinator = coordinator
+        self._attr_unique_id = (
+            f"{coordinator.entry.entry_id}_automation_security_report_unread"
+        )
+
+    @property
+    def device_info(self):
+        return hub_device_info(self.coordinator)
+
+    @property
+    def is_on(self):
+        return self.coordinator.maintenance_reports.automation_unread
+
+    @property
+    def extra_state_attributes(self):
+        latest = self.coordinator.maintenance_reports.latest(
+            report_source="automation"
+        )
+        return {
+            "report_id": latest.get("report_id") if latest else None,
+            "report_source": "automation",
+        }
 
 
 class PatchMonHostSecurityCycleSensor(_ReportListener, PatchMonHostEntity, SensorEntity):
@@ -91,17 +129,23 @@ class PatchMonHostSecurityCycleSensor(_ReportListener, PatchMonHostEntity, Senso
 
     @property
     def native_value(self):
-        match = self.coordinator.maintenance_reports.latest_host(self.host_id)
+        match = self.coordinator.maintenance_reports.latest_host(
+            self.host_id, report_source="automation"
+        )
         return match[1].get("state", "unknown") if match else "never"
 
     @property
     def extra_state_attributes(self):
-        match = self.coordinator.maintenance_reports.latest_host(self.host_id)
+        match = self.coordinator.maintenance_reports.latest_host(
+            self.host_id, report_source="automation"
+        )
         if not match:
             return {"host_id": self.host_id}
         report, host = match
         return {
             "report_id": report.get("report_id"),
+            "report_source": report.get("report_source", "automation"),
+            "report_type": report.get("report_type", "security_maintenance"),
             "date": report.get("completed_at"),
             "host_id": self.host_id,
             "selected_security_packages": host.get("security_count", 0),

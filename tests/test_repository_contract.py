@@ -31,6 +31,18 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_documented_dashboard_resource_is_shipped(self):
         self.assertTrue((COMP / 'www' / 'patchmon-security-report-card.js').is_file())
+
+    def test_report_panel_and_native_dialog_contract(self):
+        manifest = json.loads((COMP / 'manifest.json').read_text())
+        source = (COMP / 'www' / 'patchmon-security-report-card.js').read_text()
+        self.assertIn('panel_custom', manifest['dependencies'])
+        self.assertIn('patchmon-security-report-panel', source)
+        self.assertIn('patchmon-security-report-dialog', source)
+        self.assertIn('show-dialog', source)
+        self.assertIn('report_source: this._cfg.report_source', source)
+        self.assertIn('report_source: this._params.report_source', source)
+        self.assertNotIn('if (!reportId) return;', source)
+        self.assertNotIn('hide_when_read &&', source)
         guide = (ROOT / 'docs' / 'security-maintenance.md').read_text()
         for value in ('mode: attention', 'mode: viewer', 'mode: host',
                       'patchmon.get_security_reports', 'require_backup_checks'):
@@ -38,6 +50,11 @@ class RepositoryContractTests(unittest.TestCase):
         for name in ('dashboard_cards.yaml', 'weekly_security_automation.yaml',
                      'manual_actions.yaml'):
             self.assertTrue((ROOT / 'docs' / 'examples' / name).exists())
+
+    def test_inventory_timestamp_has_specific_name(self):
+        source = (COMP / 'sensor.py').read_text()
+        self.assertIn('_attr_name = "Last agent inventory"', source)
+        self.assertNotIn('_attr_name = "Last report"', source)
 
 
 if __name__ == '__main__':
