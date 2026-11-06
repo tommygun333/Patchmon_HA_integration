@@ -28,6 +28,18 @@
           "api_id": "API ID",
           "api_key": "API key"
         }
+      },
+      "reconfigure": {
+        "title": "Reconfigure PatchMon connection",
+        "description": "Change the PatchMon server address without removing this integration. Enter a full URL such as `http://192.168.1.33:3000`. Existing API credentials, host settings, entity IDs, and saved reports are preserved. The new endpoint must be reachable and allow host:get.",
+        "data": {
+          "url": "Server URL (IP or hostname with port)",
+          "verify_ssl": "Verify SSL certificate"
+        },
+        "data_description": {
+          "url": "Full http:// or https:// URL of the same PatchMon server.",
+          "verify_ssl": "Applies to HTTPS endpoints; leave enabled for trusted certificates."
+        }
       }
     },
     "error": {
@@ -37,10 +49,12 @@
       "missing_scope": "The API credential needs the host:get scope",
       "patch_credentials_incomplete": "Enter both username and password, or neither",
       "two_factor_required": "Two-factor account cannot be used for unattended patch actions",
-      "unknown": "Unexpected PatchMon API response"
+      "unknown": "Unexpected PatchMon API response",
+      "already_configured": "Another PatchMon integration already uses this server address."
     },
     "abort": {
-      "already_configured": "This server is already configured"
+      "already_configured": "This server is already configured",
+      "reconfigure_successful": "PatchMon connection updated; the existing integration is reloading."
     }
   },
   "options": {

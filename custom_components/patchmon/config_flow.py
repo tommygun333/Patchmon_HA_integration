@@ -159,6 +159,84 @@ class PatchMonConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Switch the server URL in-place, preserving entities and options.
+
+        This integration historically used the endpoint URL as its unique ID.
+        Move that unique ID with the URL to prevent duplicate config entries;
+        never remove/recreate the existing entry. The existing update listener
+        handles reloading, so async_update_and_abort avoids a double reload.
+        """
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                requested_url = _valid_url(user_input[CONF_URL])
+            except (KeyError, vol.Invalid):
+                errors[CONF_URL] = "invalid_url"
+            else:
+                updated_data = {
+                    **entry.data,
+                    CONF_URL: requested_url,
+                    CONF_VERIFY_SSL: user_input.get(
+                        CONF_VERIFY_SSL, entry.data.get(CONF_VERIFY_SSL, True)
+                    ),
+                }
+                client = _client_from_input(self.hass, updated_data)
+                next_unique_id = client.base_url.lower()
+
+                # A second configured entry cannot already own the new URL.
+                # Comparing by entry_id is essential: changing this entry's
+                # own URL is allowed and must not look like a duplicate.
+                if any(
+                    other.entry_id != entry.entry_id
+                    and other.unique_id == next_unique_id
+                    for other in self.hass.config_entries.async_entries(DOMAIN)
+                ):
+                    errors["base"] = "already_configured"
+                else:
+                    try:
+                        # Verify the *new* destination with existing scoped API
+                        # credentials. User patch-login credentials remain
+                        # unchanged, managed separately by the reauth flow.
+                        await client.async_get_hosts()
+                    except PatchMonTwoFactorRequired:
+                        errors["base"] = "two_factor_required"
+                    except PatchMonAuthenticationError:
+                        errors["base"] = "invalid_auth"
+                    except PatchMonPermissionError:
+                        errors["base"] = "missing_scope"
+                    except PatchMonConnectionError:
+                        errors["base"] = "cannot_connect"
+                    except PatchMonError:
+                        errors["base"] = "unknown"
+                    else:
+                        # Do not replace entry.data, options, or entry_id.
+                        # In particular, preserve selected automatic hosts,
+                        # tracked packages, and persistent report storage.
+                        return self.async_update_and_abort(
+                            entry,
+                            unique_id=next_unique_id,
+                            data_updates={
+                                CONF_URL: client.base_url,
+                                CONF_VERIFY_SSL: updated_data[CONF_VERIFY_SSL],
+                            },
+                        )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=vol.Schema({
+                vol.Required(CONF_URL, default=entry.data[CONF_URL]): URL_SELECTOR,
+                vol.Required(
+                    CONF_VERIFY_SSL,
+                    default=entry.data.get(CONF_VERIFY_SSL, True),
+                ): bool,
+            }),
+            errors=errors,
+        )
+
     @staticmethod
     def async_get_options_flow(config_entry):
         return PatchMonOptionsFlow()

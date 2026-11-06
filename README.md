@@ -220,3 +220,30 @@ node --check custom_components/patchmon/www/patchmon-security-report-card.js
 ```
 
 GitHub Actions runs the Python tests on 3.12 and 3.13 plus HACS/hassfest validation. The repository excludes `*.bak` and `__pycache__` artifacts: use Git history rather than committed local backups for rollback.
+
+## Transient network failures and retries
+
+Read-only PatchMon HTTP queries (`GET`) and the authentication login request use up to three attempts when DNS resolution, connections, request timeouts, or HTTP 408/500/502/503/504 temporarily fail. Retries wait 1s then 2s; each attempt retains the existing 30-second timeout. HTTP 401/403, rate limiting (429), and invalid API payloads are not retried. The client logs retried attempts without exposing API credentials.
+
+**Safety:** Package patch triggers, validation submissions, install approvals, and all other state-changing POST requests are never automatically replayed after an uncertain failure. A timed-out write may have succeeded remotely; inspect the existing PatchMon run before manually repeating it.
+
+## Change the PatchMon server address without losing settings
+
+Use **Settings → Devices & services → PatchMon → three-dot menu → Reconfigure**.
+Enter the new full URL, e.g. `http://192.168.1.33:3000`, and confirm.
+Home Assistant tests the destination with the existing scoped API credential
+before saving. An invalid or unreachable address leaves the old URL intact.
+
+The existing config entry and its entity unique IDs are preserved, along
+with host selection, watched packages, saved maintenance and validation reports,
+and automation references. The URL-based config-entry unique ID is updated
+atomically to the new normalized URL, so a future Add integration cannot create
+a duplicate for the new endpoint. The existing config-entry update listener
+reloads the integration once after success. Make sure the new address points
+to the **same PatchMon server**, since different servers can have different
+host UUIDs.
+
+Reconfigure only changes URL and SSL verification; it does not overwrite API
+keys or patching login credentials. If credentials need changing, use reauth.
+When connecting directly by IP, include the scheme and port; for example,
+`http://192.168.1.33:3000` rather than only `192.168.1.33:3000`.

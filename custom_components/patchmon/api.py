@@ -10,11 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from http import HTTPStatus
 from typing import Any
 
 from aiohttp import BasicAuth, ClientError, ClientResponse, ClientSession, WSMsgType, WSServerHandshakeError
+
+
+_LOGGER = logging.getLogger(__name__)
+# Exactly three total attempts for safe queries (one request + two retries).
+_READ_RETRY_DELAYS = (1.0, 2.0)
+_RETRYABLE_READ_HTTP_STATUSES = frozenset({408, 500, 502, 503, 504})
 
 
 class PatchMonError(Exception):
@@ -263,23 +270,64 @@ class PatchMonClient:
             return await self._request(method, path, auth="bearer", **kwargs)
 
     async def _request(self, method: str, path: str, *, auth: str | None, **kwargs: Any) -> dict[str, Any]:
+        """Retry transient failures ONLY when repeating a request is safe.
+
+        GET inventory/status reads are idempotent. Login POST can safely be
+        repeated, but patch triggers, approvals, and other POST requests must
+        NEVER be replayed after a timeout: the server may have acted already.
+        Each attempt retains the existing 30-second timeout. Cancellation is
+        deliberately not caught, so Home Assistant can stop an outstanding read.
+        """
         headers = dict(kwargs.pop("headers", {}))
         request_auth = None
         if auth == "basic":
             request_auth = self._basic_auth
         elif auth == "bearer":
             headers["Authorization"] = f"Bearer {self._access_token}"
-        try:
-            async with asyncio.timeout(30):
-                response = await self._session.request(
-                    method, f"{self.base_url}{path}", auth=request_auth,
-                    headers=headers, ssl=self._verify_ssl, **kwargs
+
+        safe_to_retry = method.upper() == "GET" or (
+            method.upper() == "POST" and path == "/api/v1/auth/login"
+        )
+        attempts = len(_READ_RETRY_DELAYS) + 1 if safe_to_retry else 1
+        for attempt in range(attempts):
+            try:
+                async with asyncio.timeout(30):
+                    response = await self._session.request(
+                        method, f"{self.base_url}{path}", auth=request_auth,
+                        headers=headers, ssl=self._verify_ssl, **kwargs
+                    )
+                    if (safe_to_retry
+                            and response.status in _RETRYABLE_READ_HTTP_STATUSES
+                            and attempt + 1 < attempts):
+                        # Return the connection to aiohttp's pool before retrying.
+                        release = getattr(response, "release", None)
+                        if callable(release):
+                            release()
+                        _LOGGER.warning(
+                            "PatchMon %s %s returned HTTP %s; retrying (%s/%s)",
+                            method, path, response.status, attempt + 1, attempts,
+                        )
+                    else:
+                        # Authentication, authorization, 429, invalid JSON and
+                        # all other non-transient responses keep their old behavior.
+                        return await self._handle_response(response)
+            except (TimeoutError, ClientError) as err:
+                if not safe_to_retry or attempt + 1 >= attempts:
+                    if isinstance(err, TimeoutError):
+                        raise PatchMonConnectionError(
+                            f"Timed out connecting to PatchMon after {attempt + 1} attempt(s)"
+                        ) from err
+                    raise PatchMonConnectionError(
+                        f"Could not connect to PatchMon after {attempt + 1} attempt(s): {err}"
+                    ) from err
+                _LOGGER.warning(
+                    "PatchMon %s %s transient network error (%s); retrying (%s/%s)",
+                    method, path, type(err).__name__, attempt + 1, attempts,
                 )
-                return await self._handle_response(response)
-        except TimeoutError as err:
-            raise PatchMonConnectionError("Timed out connecting to PatchMon") from err
-        except ClientError as err:
-            raise PatchMonConnectionError(f"Could not connect to PatchMon: {err}") from err
+            # No delay after the final attempt; this branch only runs when a
+            # retry is still available (failed HTTP response or exception).
+            await asyncio.sleep(_READ_RETRY_DELAYS[attempt])
+        raise AssertionError("PatchMon HTTP retry loop ended unexpectedly")
 
     @staticmethod
     async def _handle_response(response: ClientResponse) -> dict[str, Any]:
